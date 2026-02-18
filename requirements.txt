@@ -1,3 +1,4 @@
 streamlit
 yfinance
 google-genai
+PyPDF2
