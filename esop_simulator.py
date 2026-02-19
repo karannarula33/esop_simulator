@@ -260,4 +260,140 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
 # ==========================================
 # NODE 3: THE WEB DASHBOARD (Streamlit UI)
 # ==========================================
-st.set_page_config(page_title="Smart ESOP Advisory",
+st.set_page_config(page_title="Smart ESOP Advisory", page_icon="📈", layout="wide")
+st.title("📈 Smart ESOP Investment & Advisory Platform")
+
+# --- SIDEBAR ---
+st.sidebar.header("⚙️ Portfolio Configuration")
+ticker = st.sidebar.text_input("Live Ticker Symbol", value="MEESHO.NS")
+emp_status = st.sidebar.radio("Employment Status", ["Active Employee", "Ex-Employee"])
+
+st.sidebar.divider()
+st.sidebar.subheader("🏦 Funding Partner Selection")
+selected_partner = st.sidebar.selectbox("Select your financer:", list(FUNDING_PARTNERS.keys()))
+active_terms = FUNDING_PARTNERS[selected_partner]
+
+st.sidebar.divider()
+st.sidebar.subheader("🧮 Loan & Equity Calculator")
+
+vested_options = st.sidebar.number_input("Total Vested Options (ESOPs)", min_value=0, value=0, step=100)
+total_shares = st.sidebar.number_input("Total Resulting Shares", min_value=0, value=0, step=100)
+fmv_on_exercise = st.sidebar.number_input("FMV on Exercise Date (₹)", min_value=0.0, value=130.0, step=1.0)
+
+if 'principal_loan' not in st.session_state: st.session_state.principal_loan = 0.0
+if 'calc_breakdown' not in st.session_state: st.session_state.calc_breakdown = ""
+
+if st.sidebar.button("Calculate Exact Loan Needed"):
+    if vested_options > 0 and total_shares > 0 and fmv_on_exercise > 0:
+        exercise_payable = vested_options * 1
+        perq_value = (total_shares * fmv_on_exercise) - exercise_payable
+        tax_rate = 0.30 if emp_status == "Active Employee" else 0.4274
+        perq_tax = perq_value * tax_rate
+        
+        st.session_state.principal_loan = round(exercise_payable + perq_tax, 2)
+        st.session_state.calc_breakdown = f"**Calculation Breakdown:**\n- Exercise Price: ₹{exercise_payable:,.2f}\n- Perquisite Value: ₹{perq_value:,.2f}\n- Perquisite Tax ({tax_rate*100}%): ₹{perq_tax:,.2f}\n- **Total Loan: ₹{st.session_state.principal_loan:,.2f}**"
+    else:
+        st.sidebar.warning("Enter Options, Shares, and FMV first.")
+
+if st.session_state.calc_breakdown: st.sidebar.info(st.session_state.calc_breakdown)
+
+principal_loan = st.sidebar.number_input("Total Loan Principal (₹)", min_value=0.0, value=float(st.session_state.principal_loan), step=10000.0)
+
+loan_sanction_date = st.sidebar.date_input("Loan Sanction Date", datetime.date.today() - datetime.timedelta(days=1))
+days_held = max(1, (datetime.date.today() - loan_sanction_date).days)
+st.sidebar.caption(f"Days Loan Held: **{days_held} days**")
+sim_days = st.sidebar.slider("Simulate Future Date (Days Held)", min_value=1, max_value=400, value=days_held)
+
+st.sidebar.divider()
+st.sidebar.subheader("💸 Cash Injections (Multiple)")
+if 'prepayments_df' not in st.session_state: st.session_state.prepayments_df = pd.DataFrame({"Day": [15], "Amount (₹)": [0]})
+edited_prepayments = st.sidebar.data_editor(st.session_state.prepayments_df, num_rows="dynamic", hide_index=True)
+prepayments_list = list(zip(edited_prepayments["Day"], edited_prepayments["Amount (₹)"]))
+
+# --- MAIN DASHBOARD ---
+if total_shares == 0 or principal_loan == 0:
+    st.info("👋 Welcome. Please enter your Equity details and calculate your Loan Principal in the sidebar to begin.")
+else:
+    todays_debt = calculate_loan_debt(principal_loan, sim_days, prepayments_list, active_terms)
+    market_data = get_market_data(ticker)
+    live_price = market_data['current_price']
+
+    if live_price > 0:
+        strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
+        
+        danger_price = todays_debt / (total_shares * active_terms['margin_ltv'])
+        
+        st.header(f"Simulated Execution Status (Day {sim_days})")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Live Share Price", f"₹{live_price:,.2f}")
+        col2.metric("Simulated Debt", f"₹{todays_debt:,.2f}")
+        col3.metric("Net Pocketed / Share", f"₹{strategy['net_pocketed']:,.2f}")
+        
+        st.divider()
+        col4, col5 = st.columns(2)
+        col4.metric("Shares to Sell to Clear Debt", f"{strategy['shares_to_sell']:,}", delta_color="inverse")
+        col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Gross Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
+        
+        st.warning(f"🚨 **{int(active_terms['margin_ltv']*100)}% LTV Margin Call Threshold ({selected_partner}):** ₹{danger_price:,.2f} per share. (If your stock drops to this price, your loan LTV hits {int(active_terms['margin_ltv']*100)}%. You then have a strict {active_terms['cure_period_days']}-day cure window to inject cash or sell before forced liquidation).")
+
+        wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date, active_terms)
+        
+        st.divider()
+        st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
+        
+        if market_data['has_analyst_data']:
+            st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
+        else:
+            st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are unavailable for this ticker. Targets shown are simulated (+25% / +10% / -15%).")
+            
+        fig_price = px.line(
+            price_df.reset_index(), 
+            x="Date", 
+            y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"],
+            color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"]
+        )
+        fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
+        fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
+        st.plotly_chart(fig_price, use_container_width=True)
+        
+        st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
+        st.caption("Notice the vertical 'step up' at month 12 when your tax burden drops to the 12.5% LTCG rate.")
+        
+        fig_wealth = px.line(
+            wealth_df.reset_index(), 
+            x="Date", 
+            y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Call Threshold (₹)", "Total Debt (₹)"],
+            color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"],
+            custom_data=["Underlying Share Price"]
+        )
+        fig_wealth.update_traces(hovertemplate="₹%{y:,.2f}  (Share Price: %{customdata[0]})")
+        fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
+        st.plotly_chart(fig_wealth, use_container_width=True)
+        
+        # --- BOTTOM SECTION: INLINE CHAT ---
+        st.divider()
+        st.subheader("🧠 Interactive Algorithmic Execution Agent")
+        tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, sim_days)
+        
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+            with st.spinner("Analyzing portfolio health..."):
+                baseline_plan = generate_ai_insights("", emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, is_default=True)
+                st.session_state.messages.append({"role": "assistant", "content": f"{baseline_plan}"})
+                
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        with st.form("strategy_chat_form", clear_on_submit=True):
+            user_prompt = st.text_input("Reply with A, B, C, or type a custom goal:", placeholder="e.g., 'C - I need ₹20 Lakhs in exactly 4 months.'")
+            submitted = st.form_submit_button("Generate Strategic Schedule")
+            
+        if submitted and user_prompt:
+            st.session_state.messages.append({"role": "user", "content": user_prompt})
+            with st.spinner("Calculating precision tranches based on your objective..."):
+                response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, is_default=False)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.rerun()
+    else:
+        st.error("Could not fetch live market data. Please check the ticker symbol.")
