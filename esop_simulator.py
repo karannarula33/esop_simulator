@@ -135,7 +135,7 @@ if 'calc_breakdown' not in st.session_state:
 
 if st.sidebar.button("Calculate Exact Loan Needed"):
     if vested_options > 0 and total_shares > 0 and fmv_on_exercise > 0:
-        [cite_start]exercise_payable = vested_options * 1 # INR 1 per option [cite: 186]
+        exercise_payable = vested_options * 1
         [cite_start]perq_value = (total_shares * fmv_on_exercise) - exercise_payable [cite: 239]
         [cite_start]tax_rate = 0.30 if emp_status == "Active Employee" else 0.4274 [cite: 503, 504]
         [cite_start]perq_tax = perq_value * tax_rate [cite: 241]
