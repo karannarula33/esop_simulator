@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import yfinance as yf
 import streamlit as st
-import PyPDF2
+import datetime
 from google import genai
 from google.genai import types
 
@@ -33,7 +33,7 @@ def calculate_nuvama_debt(principal: float, days_elapsed: int, prepayments: list
     return round(current_principal + total_fees_at_closure + total_interest, 2)
 
 # ==========================================
-# NODE 1.5: THE MARKET & NEWS FEED
+# NODE 1.5: THE MARKET FEED
 # ==========================================
 @st.cache_data(ttl=60)
 def get_live_stock_price(ticker_symbol: str) -> float:
@@ -41,38 +41,6 @@ def get_live_stock_price(ticker_symbol: str) -> float:
         return round(yf.Ticker(ticker_symbol).fast_info['last_price'], 2)
     except:
         return 0.0
-
-@st.cache_data(ttl=3600)
-def get_market_intelligence(ticker_symbol: str, api_key: str) -> str:
-    """Fetches financial data & news, then uses AI to generate a concise macro summary."""
-    if not api_key: return "⚠️ API Key required for Market Intelligence."
-    try:
-        stock = yf.Ticker(ticker_symbol)
-        info = stock.info
-        news = stock.news[:4]
-        
-        financial_context = f"""
-        Ticker: {ticker_symbol}
-        Current Price: {info.get('currentPrice', 'N/A')}
-        52 Week High/Low: {info.get('fiftyTwoWeekHigh', 'N/A')} / {info.get('fiftyTwoWeekLow', 'N/A')}
-        Market Cap: {info.get('marketCap', 'N/A')}
-        Trailing P/E: {info.get('trailingPE', 'N/A')}
-        Recent News Headlines: {[n['title'] for n in news]}
-        """
-        
-        client = genai.Client(api_key=api_key)
-        prompt = f"""
-        Analyze this raw financial data for {ticker_symbol}: {financial_context}
-        Provide a highly concise, 3-bullet summary covering:
-        1. The company's current market position/trajectory.
-        2. Broader industry/country macroeconomic landscape sentiment.
-        3. A quick summary of recent news catalysts.
-        Keep it brief, articulate, and strictly factual. Maximum 100 words total.
-        """
-        response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-        return response.text
-    except Exception as e:
-        return f"Unable to fetch market intelligence: {str(e)}"
 
 # ==========================================
 # NODE 2: THE LIQUIDATION & TAX ENGINE
@@ -98,31 +66,40 @@ def calculate_taxes(shares_sold: int, sell_price: float, fmv_on_exercise: float,
 # ==========================================
 # NODE 4: THE TRAINED QUANTITATIVE AGENT
 # ==========================================
-def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, debt: float, share_price: float, strategy: dict, margin_call: float, tax_data: dict, user_goals: str):
+def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, debt: float, share_price: float, strategy: dict, margin_call: float, tax_data: dict, is_default: bool = False):
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key: return "⚠️ Error: Gemini API Key not found."
     
     trading_constraint = "SUBJECT TO STRICT 20-DAY QUARTERLY TRADING WINDOWS." if emp_status == "Active Employee" else "NO TRADING WINDOW RESTRICTIONS (Ex-Employee)."
     
-    prompt = f"""
+    system_instruction = """
     You are an elite quantitative wealth advisor. 
-    
-    --- USER CONTEXT ---
-    Status: {emp_status}
-    Trading Rules: {trading_constraint}
-    Query: "{user_query}"
-    Goals: {user_goals if user_goals else 'Clear debt efficiently.'}
-    
-    --- FINANCIAL STATE ---
-    Total Shares: {total_shares:,} | Loan Debt: ₹{debt:,.2f} | Share Price: ₹{share_price:,.2f}
-    Min Shares to Clear Debt: {strategy.get('shares_to_sell', 0):,} | Margin Call: ₹{margin_call:,.2f}
-    Tax Trigger: {tax_data['tax_type']} (Liability: ₹{tax_data['tax_liability']:,.2f})
-    
-    --- EXECUTION FRAMEWORK ---
-    1. Answer the user's query directly and mathematically.
-    2. If suggesting a selling strategy, provide explicit tranche sizes (e.g., "Sell X shares today").
-    3. CRITICAL: Be extremely concise and articulate. Use short bullet points. Cut all fluff, introductory greetings, and verbose explanations. Provide pure, actionable financial strategy.
+    1. Answer mathematically and structurally.
+    2. Suggest explicit tranche sizes based on established portfolio de-risking principles.
+    3. CRITICAL: Be extremely concise. Use short bullet points. Eliminate all fluff.
     """
+    
+    if is_default:
+        prompt = f"""
+        {system_instruction}
+        --- FINANCIAL STATE ---
+        Status: {emp_status} | Rules: {trading_constraint}
+        Total Shares: {total_shares:,} | Loan Debt: ₹{debt:,.2f} | Share Price: ₹{share_price:,.2f}
+        Min Shares to Clear Debt: {strategy.get('shares_to_sell', 0):,} | Margin Call: ₹{margin_call:,.2f}
+        Tax Trigger: {tax_data['tax_type']} (Liability: ₹{tax_data['tax_liability']:,.2f})
+        
+        Provide the definitive, mathematically optimal baseline selling strategy (Default Plan). How should they structure their tranches to clear the debt efficiently while maximizing retained wealth?
+        """
+    else:
+        prompt = f"""
+        {system_instruction}
+        --- FINANCIAL STATE ---
+        Status: {emp_status} | Rules: {trading_constraint}
+        Total Shares: {total_shares:,} | Loan Debt: ₹{debt:,.2f} | Share Price: ₹{share_price:,.2f}
+        
+        The user asks: "{user_query}"
+        Refine their strategy based on this specific request.
+        """
     
     try:
         client = genai.Client(api_key=api_key)
@@ -144,31 +121,45 @@ emp_status = st.sidebar.radio("Employment Status", ["Active Employee", "Ex-Emplo
 
 st.sidebar.divider()
 st.sidebar.subheader("🧮 Loan & Equity Calculator")
-grant_type = st.sidebar.selectbox("Grant Type", ["Meesho Ltd (1:49)", "Meesho Inc (1:60)"])
-entitlement_ratio = 49 if "Ltd" in grant_type else 60
+st.sidebar.caption("Mix of 1:49 and 1:60 grants? Enter total options and total resulting shares below.")
 
-vested_esops = st.sidebar.number_input("Vested ESOPs (Options)", min_value=0, value=0, step=100)
-total_shares = vested_esops * entitlement_ratio
-st.sidebar.caption(f"Calculated Total Shares: **{total_shares:,}**")
-
+vested_options = st.sidebar.number_input("Total Vested Options (ESOPs)", min_value=0, value=0, step=100)
+total_shares = st.sidebar.number_input("Total Resulting Shares", min_value=0, value=0, step=100)
 fmv_on_exercise = st.sidebar.number_input("FMV on Exercise Date (₹)", min_value=0.0, value=130.0, step=1.0)
 
-# Session State for Loan Amount
+# Session State for Loan Amount & Breakdown
 if 'principal_loan' not in st.session_state:
     st.session_state.principal_loan = 0.0
+if 'calc_breakdown' not in st.session_state:
+    st.session_state.calc_breakdown = ""
 
 if st.sidebar.button("Calculate Exact Loan Needed"):
-    if vested_esops > 0 and fmv_on_exercise > 0:
-        exercise_payable = vested_esops * 1 # INR 1 per option
-        perq_value = (total_shares * fmv_on_exercise) - exercise_payable
-        tax_rate = 0.30 if emp_status == "Active Employee" else 0.4274
-        perq_tax = perq_value * tax_rate
+    if vested_options > 0 and total_shares > 0 and fmv_on_exercise > 0:
+        [cite_start]exercise_payable = vested_options * 1 # INR 1 per option [cite: 186]
+        [cite_start]perq_value = (total_shares * fmv_on_exercise) - exercise_payable [cite: 239]
+        [cite_start]tax_rate = 0.30 if emp_status == "Active Employee" else 0.4274 [cite: 503, 504]
+        [cite_start]perq_tax = perq_value * tax_rate [cite: 241]
+        
         st.session_state.principal_loan = round(exercise_payable + perq_tax, 2)
+        st.session_state.calc_breakdown = f"""
+        **Calculation Breakdown:**
+        - Exercise Price ({vested_options} opts * ₹1): ₹{exercise_payable:,.2f}
+        - Perquisite Value: ₹{perq_value:,.2f}
+        - Perquisite Tax ({tax_rate*100}%): ₹{perq_tax:,.2f}
+        - **Total Loan: ₹{st.session_state.principal_loan:,.2f}**
+        """
     else:
-        st.sidebar.warning("Enter ESOPs and FMV first.")
+        st.sidebar.warning("Enter Options, Shares, and FMV first.")
+
+if st.session_state.calc_breakdown:
+    st.sidebar.info(st.session_state.calc_breakdown)
 
 principal_loan = st.sidebar.number_input("Total Loan Principal (₹)", min_value=0.0, value=float(st.session_state.principal_loan), step=10000.0)
-days_held = st.sidebar.slider("Days Loan Held", min_value=1, max_value=400, value=1)
+
+# Rolling Date Logic
+loan_sanction_date = st.sidebar.date_input("Loan Sanction Date", datetime.date.today() - datetime.timedelta(days=1))
+days_held = max(1, (datetime.date.today() - loan_sanction_date).days)
+st.sidebar.caption(f"Days Loan Held: **{days_held} days**")
 
 st.sidebar.divider()
 st.sidebar.subheader("💸 Cash Injections (Multiple)")
@@ -179,7 +170,7 @@ prepayments_list = list(zip(edited_prepayments["Day"], edited_prepayments["Amoun
 
 # --- MAIN DASHBOARD ---
 if total_shares == 0 or principal_loan == 0:
-    st.info("👋 Welcome. Please enter your Vested ESOPs and calculate your Loan Principal in the sidebar to begin.")
+    st.info("👋 Welcome. Please enter your Equity details and calculate your Loan Principal in the sidebar to begin.")
 else:
     todays_debt = calculate_nuvama_debt(principal_loan, days_held, prepayments_list)
     live_price = get_live_stock_price(ticker)
@@ -199,38 +190,33 @@ else:
         col4.metric("Shares to Sell Today", f"{strategy['shares_to_sell']:,}", "To Break Even on Loan", delta_color="inverse")
         col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
         
-        # 2. MIDDLE SECTION: Market Intelligence
+        # 2. BOTTOM SECTION: Goal Setting & Strategy Chat
         st.divider()
-        st.subheader("🌐 Market & Financial Intelligence")
-        with st.spinner("Compiling macroeconomic and financial data..."):
-            api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
-            market_brief = get_market_intelligence(ticker, api_key)
-            st.info(market_brief)
-
-        # 3. BOTTOM SECTION: Goal Setting & Strategy Chat
-        st.divider()
-        st.subheader("🎯 Custom Strategy & AI Advisor")
-        user_goals = st.text_input("Optional: Define specific goals (e.g., 'Need ₹20L in 3 months for a house')")
+        st.subheader("🧠 Quantitative Execution Plan")
         
+        total_sell_margin = 0.0002 + 0.0002 + 0.001
+        danger_price = todays_debt / (total_shares * (1 - total_sell_margin))
+        tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, days_held)
+        
+        # The "Zero-Click" Default AI Trigger
         if "messages" not in st.session_state:
             st.session_state.messages = []
-            
+            with st.spinner("Computing baseline optimal strategy..."):
+                baseline_plan = generate_ai_insights("", emp_status, total_shares, todays_debt, live_price, strategy, danger_price, tax_data, is_default=True)
+                st.session_state.messages.append({"role": "assistant", "content": f"**Default Optimal Strategy Generated:**\n\n{baseline_plan}"})
+                
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        if prompt := st.chat_input("E.g., 'Develop a minimal-tax selling strategy.'"):
+        if prompt := st.chat_input("Refine this strategy (e.g., 'Adjust tranche 2 to account for a ₹20L cash requirement next month')"):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
                 
             with st.chat_message("assistant"):
-                with st.spinner("Computing concise execution strategy..."):
-                    total_sell_margin = 0.0002 + 0.0002 + 0.001
-                    danger_price = todays_debt / (total_shares * (1 - total_sell_margin))
-                    tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, days_held)
-                    
-                    response = generate_ai_insights(prompt, emp_status, total_shares, todays_debt, live_price, strategy, danger_price, tax_data, user_goals)
+                with st.spinner("Recalculating strategy..."):
+                    response = generate_ai_insights(prompt, emp_status, total_shares, todays_debt, live_price, strategy, danger_price, tax_data, is_default=False)
                     st.markdown(response)
                     st.session_state.messages.append({"role": "assistant", "content": response})
     else:
