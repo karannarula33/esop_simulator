@@ -378,7 +378,7 @@ else:
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
-        if market_data['has_analyst_data']: st.success("✅ **Data Provenance:** Target benchmarks are pulled from live NSE Analyst Consensus.")
+        if market_data['has_analyst_data']: st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Analyst Consensus.")
         else: st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are unavailable for this ticker.")
             
         fig_price = px.line(price_df.reset_index(), x="Date", y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"], color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"])
