@@ -5,6 +5,7 @@ import numpy as np
 import yfinance as yf
 import streamlit as st
 import datetime
+import plotly.express as px
 from google import genai
 from google.genai import types
 
@@ -121,22 +122,24 @@ def generate_projection_data(principal: float, total_shares: int, fmv_on_exercis
         tax_hit = calculate_taxes(total_shares, current_sim_price, fmv_on_exercise, d)['tax_liability']
         net_wealth = max(0, gross_value - debt - tax_hit)
 
-        # Store data for the Wealth Chart
+        # Injecting Simulated Price explicitly as a string for clean tooltip formatting
+        formatted_price = f"₹{current_sim_price:,.2f}"
+
         wealth_data.append({
             "Date": current_date,
             "Gross Portfolio Value (₹)": gross_value,
             "Net Wealth (₹)": net_wealth,
             "Margin Call Threshold (₹)": margin_call_level,
-            "Total Debt (₹)": debt
+            "Total Debt (₹)": debt,
+            "Underlying Share Price": formatted_price
         })
         
-        # Store data for the Price Chart
         price_data.append({
             "Date": current_date,
-            "Simulated Price": current_sim_price,
-            "Bull Target": market_data['bull_target'],
-            "Base Target": market_data['base_target'],
-            "Bear Target": market_data['bear_target']
+            "Simulated Price (₹)": current_sim_price,
+            "Bull Target (₹)": market_data['bull_target'],
+            "Base Target (₹)": market_data['base_target'],
+            "Bear Target (₹)": market_data['bear_target']
         })
         
     return pd.DataFrame(wealth_data).set_index("Date"), pd.DataFrame(price_data).set_index("Date")
@@ -258,17 +261,36 @@ else:
         
         st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share.")
 
-        # --- DUAL CHART ARCHITECTURE ---
+        # --- PLOTLY DUAL CHART ARCHITECTURE ---
         wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date)
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
-        st.caption("Visualizing the simulated price trajectory against Wall Street 1-Year targets.")
-        st.line_chart(price_df, color=["#0068C9", "#29B09D", "#7C3AED", "#FF4B4B"]) 
+        st.caption("Hover over any day to see the simulated price trajectory against Wall Street 1-Year targets.")
+        
+        # Plotly Price Chart
+        fig_price = px.line(
+            price_df.reset_index(), 
+            x="Date", 
+            y=["Simulated Price (₹)", "Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)"],
+            color_discrete_sequence=["#0068C9", "#29B09D", "#7C3AED", "#FF4B4B"]
+        )
+        fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
+        st.plotly_chart(fig_price, use_container_width=True)
         
         st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
-        st.caption("Watch for the vertical 'step up' at month 12 when your tax burden drops to the 12.5% LTCG rate.")
-        st.line_chart(wealth_df, color=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"]) 
+        st.caption("Notice the vertical 'step up' at month 12 when your tax burden drops to the 12.5% LTCG rate.")
+        
+        # Plotly Wealth Chart with explicitly embedded Simulated Price in hover
+        fig_wealth = px.line(
+            wealth_df.reset_index(), 
+            x="Date", 
+            y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Call Threshold (₹)", "Total Debt (₹)"],
+            color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"],
+            hover_data={"Underlying Share Price": True, "Date": False}
+        )
+        fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
+        st.plotly_chart(fig_wealth, use_container_width=True)
         
         # --- BOTTOM SECTION: INLINE CHAT ---
         st.divider()
@@ -285,14 +307,12 @@ else:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        # Fixed Inline Form replacing the floating st.chat_input
         with st.form("strategy_chat_form", clear_on_submit=True):
             user_prompt = st.text_input("Refine this strategy with your quant advisor:", placeholder="e.g., How does this change if I need ₹10 Lakhs in cash next week?")
             submitted = st.form_submit_button("Generate Strategic Response")
             
         if submitted and user_prompt:
             st.session_state.messages.append({"role": "user", "content": user_prompt})
-            
             with st.spinner("Recalculating strategy..."):
                 response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, is_default=False)
                 st.session_state.messages.append({"role": "assistant", "content": response})
