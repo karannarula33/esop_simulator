@@ -122,7 +122,6 @@ def generate_projection_data(principal: float, total_shares: int, fmv_on_exercis
         tax_hit = calculate_taxes(total_shares, current_sim_price, fmv_on_exercise, d)['tax_liability']
         net_wealth = max(0, gross_value - debt - tax_hit)
 
-        # Injecting Simulated Price explicitly as a string for clean tooltip formatting
         formatted_price = f"₹{current_sim_price:,.2f}"
 
         wealth_data.append({
@@ -259,7 +258,8 @@ else:
         col4.metric("Shares to Sell to Clear Debt", f"{strategy['shares_to_sell']:,}", delta_color="inverse")
         col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Gross Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
         
-        st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share.")
+        # RESTORED WARNING TEXT
+        st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share. (If triggered, you have 7 days to cure the margin before forced liquidation).")
 
         # --- PLOTLY DUAL CHART ARCHITECTURE ---
         wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date)
@@ -268,27 +268,29 @@ else:
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
         st.caption("Hover over any day to see the simulated price trajectory against Wall Street 1-Year targets.")
         
-        # Plotly Price Chart
         fig_price = px.line(
             price_df.reset_index(), 
             x="Date", 
             y=["Simulated Price (₹)", "Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)"],
             color_discrete_sequence=["#0068C9", "#29B09D", "#7C3AED", "#FF4B4B"]
         )
+        # Cleaned up tooltip formatting
+        fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
         fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
         st.plotly_chart(fig_price, use_container_width=True)
         
         st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
         st.caption("Notice the vertical 'step up' at month 12 when your tax burden drops to the 12.5% LTCG rate.")
         
-        # Plotly Wealth Chart with explicitly embedded Simulated Price in hover
         fig_wealth = px.line(
             wealth_df.reset_index(), 
             x="Date", 
             y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Call Threshold (₹)", "Total Debt (₹)"],
             color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"],
-            hover_data={"Underlying Share Price": True, "Date": False}
+            custom_data=["Underlying Share Price"]
         )
+        # Explicit override to strip "variable=" and append the Share Price cleanly
+        fig_wealth.update_traces(hovertemplate="₹%{y:,.2f}  (Share Price: %{customdata[0]})")
         fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
         st.plotly_chart(fig_wealth, use_container_width=True)
         
