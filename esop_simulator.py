@@ -137,10 +137,7 @@ def get_macro_context(ticker_symbol: str) -> dict:
     try: macro_data["india_vix"] = round(yf.Ticker('^INDIAVIX').fast_info['last_price'], 2)
     except: pass
     
-    # 1. Broad Market News via Moneycontrol RSS
     macro_data["moneycontrol_headlines"] = get_rss_news("https://www.moneycontrol.com/rss/MCtopnews.xml", 4)
-    
-    # 2. Ticker Specific News via Google News RSS
     clean_ticker = ticker_symbol.replace('.NS', '').replace('.BO', '')
     query = urllib.parse.quote(f"{clean_ticker} stock India")
     gnews_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -283,13 +280,20 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
         User replied: "{user_query}"
         
         Generate a mathematically precise, multi-tranche execution schedule. 
-        CRITICAL: Your schedule MUST adapt to the "Market Weather Intelligence". If the macro trend is risky or RSI is highly overbought/oversold, you must structure the tranches defensively to protect the user's capital.
+        CRITICAL DIRECTIVE: Your schedule MUST dynamically adapt to the "Market Weather Intelligence" provided in the state context. If VIX is high or RSI is overbought, accelerate selling to protect capital. If the market is stable/oversold, optimize for longer holding.
         
-        Format as:
-        **Phase 1: [Name]**
+        Format your response EXACTLY as follows:
+        **Phase 1: [Name tailored to goal]**
         * Action: [Sell X / Hold]
         * Timing: [Specific Timing]
         * Target Price: [Rupee Value]
+        * Macro Alignment: [Mandatory: Explain in 1 sentence exactly how this tranche reacts to the VIX, RSI, or Macro Trend from the CIO report]
+        
+        **Phase 2: [Name tailored to goal]**
+        * Action: [Sell X / Hold]
+        * Timing: [Specific Timing]
+        * Target Price: [Rupee Value]
+        * Macro Alignment: [Mandatory: Explain how this aligns with the current market weather]
         """
     try:
         client = genai.Client(api_key=api_key)
@@ -391,13 +395,16 @@ else:
         # --- NEW LOCATION: THE INTELLIGENCE HUB ---
         st.divider()
         st.header("🌍 Macro & Market Intelligence")
+        st.caption("This engine aggregates live institutional data and news sentiment to evaluate the broader market 'weather'. The AI Agent will dynamically adjust your selling strategy based on these conditions.")
+        
         macro_data = get_macro_context(ticker)
         
+        # Added Tooltips to explain metrics cleanly
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        col_m1.metric("NIFTY 50", f"{macro_data['nifty_price']:,.2f}")
-        col_m2.metric("India VIX (Fear Gauge)", f"{macro_data['india_vix']:,.2f}")
-        col_m3.metric("Stock RSI (14-Day)", f"{market_data.get('rsi_14', 50)}")
-        col_m4.metric("USD / INR", f"₹{macro_data['usd_inr']:,.2f}")
+        col_m1.metric("NIFTY 50", f"{macro_data['nifty_price']:,.2f}", help="The benchmark index of India's top 50 companies. Indicates broad market health and sentiment.")
+        col_m2.metric("India VIX (Fear Gauge)", f"{macro_data['india_vix']:,.2f}", help="Measures expected market volatility. >20 indicates high fear/risk. <15 indicates stability.")
+        col_m3.metric("Stock RSI (14-Day)", f"{market_data.get('rsi_14', 50)}", help="Momentum indicator. >70 means the stock is 'Overbought' (overvalued/due for a drop). <30 means 'Oversold' (undervalued/potential bounce).")
+        col_m4.metric("USD / INR", f"₹{macro_data['usd_inr']:,.2f}", help="Currency exchange rate. Impacts foreign institutional investment flows into Indian tech equities.")
         
         col_news1, col_news2 = st.columns(2)
         with col_news1:
