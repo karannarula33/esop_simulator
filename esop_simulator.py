@@ -6,6 +6,9 @@ import yfinance as yf
 import streamlit as st
 import datetime
 import plotly.express as px
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
 from google import genai
 from google.genai import types
 
@@ -48,46 +51,51 @@ FUNDING_PARTNERS = {
 # ==========================================
 def calculate_loan_debt(principal: float, days_elapsed: int, prepayments: list, terms: dict) -> float:
     if principal <= 0: return 0.0
-    
     processing_fee_base = principal * terms["processing_fee_pct"]
     processing_fee_gst = processing_fee_base * 0.18 
     total_fees_at_closure = terms["doc_fee"] + processing_fee_base + processing_fee_gst
     
     total_interest = 0.0
     current_principal = principal
-    
     for day in range(1, days_elapsed + 1):
         daily_prepayment = sum(amt for p_day, amt in prepayments if p_day == day)
         current_principal = max(0, current_principal - daily_prepayment)
-            
         daily_rate = 0.0
         for tier_day, rate in terms["interest_tiers"]:
             if day <= tier_day:
                 daily_rate = rate / 365
                 break
-        
         total_interest += current_principal * daily_rate
-        
     return round(current_principal + total_fees_at_closure + total_interest, 2)
 
 # ==========================================
-# NODE 1.5 & 1.8: MACRO & MICRO DATA FETCHERS
+# NODE 1.5: ADVANCED TECHNICAL & MICRO DATA
 # ==========================================
+def calculate_rsi(prices, period=14):
+    if len(prices) < period: return 50.0
+    delta = prices.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ema_up = up.ewm(com=period-1, adjust=False).mean()
+    ema_down = down.ewm(com=period-1, adjust=False).mean()
+    rs = ema_up / ema_down
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi.iloc[-1], 2)
+
 @st.cache_data(ttl=60)
 def get_market_data(ticker_symbol: str) -> dict:
     try:
         stock = yf.Ticker(ticker_symbol)
         info = stock.info
         current_price = info.get('currentPrice', stock.fast_info['last_price'])
-        
         hist = stock.history(period="3mo")
         if not hist.empty:
             sma_20 = hist['Close'].rolling(window=20).mean().iloc[-1]
             daily_returns = hist['Close'].pct_change().dropna()
             volatility = min(daily_returns.std() * math.sqrt(252), 0.30)
+            rsi_14 = calculate_rsi(hist['Close'], 14)
         else:
-            sma_20 = current_price
-            volatility = 0.25 
+            sma_20, volatility, rsi_14 = current_price, 0.25, 50.0 
             
         has_analyst_data = 'targetMeanPrice' in info and info['targetMeanPrice'] is not None
         bull_target = info.get('targetHighPrice') if has_analyst_data else current_price * 1.25
@@ -97,33 +105,53 @@ def get_market_data(ticker_symbol: str) -> dict:
         return {
             "current_price": round(current_price, 2), "bull_target": round(bull_target, 2),
             "base_target": round(base_target, 2), "bear_target": round(bear_target, 2),
-            "sma_20": round(sma_20, 2), "volatility": float(volatility), "has_analyst_data": has_analyst_data
+            "sma_20": round(sma_20, 2), "volatility": float(volatility), 
+            "rsi_14": rsi_14, "has_analyst_data": has_analyst_data
         }
     except:
-        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.25, "has_analyst_data": False}
+        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.25, "rsi_14": 50.0, "has_analyst_data": False}
 
-@st.cache_data(ttl=1800) # Fetch macro data every 30 mins
+# ==========================================
+# NODE 1.8: MULTI-SOURCE MACRO & RSS FETCHER
+# ==========================================
+def get_rss_news(url, max_items=4):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            xml_data = response.read()
+        root = ET.fromstring(xml_data)
+        news = []
+        for item in root.findall('.//item')[:max_items]:
+            title = item.find('title')
+            if title is not None: news.append(title.text)
+        return news
+    except Exception: return []
+
+@st.cache_data(ttl=1800)
 def get_macro_context(ticker_symbol: str) -> dict:
-    macro_data = {"nifty_price": 0.0, "usd_inr": 0.0, "news_headlines": []}
-    try:
-        nifty = yf.Ticker('^NSEI').fast_info['last_price']
-        macro_data["nifty_price"] = round(nifty, 2)
+    macro_data = {"nifty_price": 0.0, "usd_inr": 0.0, "india_vix": 0.0, "moneycontrol_headlines": [], "ticker_headlines": []}
+    try: macro_data["nifty_price"] = round(yf.Ticker('^NSEI').fast_info['last_price'], 2)
     except: pass
-    try:
-        usd = yf.Ticker('INR=X').fast_info['last_price']
-        macro_data["usd_inr"] = round(usd, 2)
+    try: macro_data["usd_inr"] = round(yf.Ticker('INR=X').fast_info['last_price'], 2)
     except: pass
-    try:
-        raw_news = yf.Ticker(ticker_symbol).news[:4]
-        macro_data["news_headlines"] = [f"{n['title']} ({n.get('publisher', 'News')})" for n in raw_news] if raw_news else ["No recent major headlines detected."]
-    except:
-        macro_data["news_headlines"] = ["News feed temporarily unavailable."]
+    try: macro_data["india_vix"] = round(yf.Ticker('^INDIAVIX').fast_info['last_price'], 2)
+    except: pass
+    
+    # 1. Broad Market News via Moneycontrol RSS
+    macro_data["moneycontrol_headlines"] = get_rss_news("https://www.moneycontrol.com/rss/MCtopnews.xml", 4)
+    
+    # 2. Ticker Specific News via Google News RSS
+    clean_ticker = ticker_symbol.replace('.NS', '').replace('.BO', '')
+    query = urllib.parse.quote(f"{clean_ticker} stock India")
+    gnews_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    macro_data["ticker_headlines"] = get_rss_news(gnews_url, 4)
+    
     return macro_data
 
 # ==========================================
-# NODE 5: THE MARKET INTELLIGENCE SYNTHESIZER
+# NODE 5: THE CIO MARKET SYNTHESIZER
 # ==========================================
-@st.cache_data(ttl=3600) # Cache the AI macro analysis for 1 hour to save tokens
+@st.cache_data(ttl=3600) 
 def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: dict) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key: return "⚠️ Setup required: Gemini API Key not found."
@@ -131,18 +159,22 @@ def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: d
     prompt = f"""
     You are a Chief Investment Officer analyzing a specific stock ({ticker}) for an employee holding leveraged ESOPs.
     
-    RAW DATA:
-    - Current Stock Price: ₹{market_data['current_price']}
-    - 20-Day Moving Average: ₹{market_data['sma_20']}
+    RAW MICRO DATA:
+    - Current Price: ₹{market_data['current_price']}
+    - 20-Day SMA: ₹{market_data['sma_20']}
+    - 14-Day RSI (Momentum): {market_data.get('rsi_14', 50)} (Note: >70 is Overbought, <30 is Oversold)
+    - Ticker News: {macro_data['ticker_headlines']}
+    
+    RAW MACRO DATA:
     - NIFTY 50 Index: {macro_data['nifty_price']}
-    - USD/INR Rate: {macro_data['usd_inr']}
-    - Latest News Headlines: {macro_data['news_headlines']}
+    - India VIX (Fear Gauge): {macro_data['india_vix']} (Note: >20 implies high market fear/volatility)
+    - Broad Market News (Moneycontrol): {macro_data['moneycontrol_headlines']}
     
     Synthesize this into a crisp, 3-bullet "Market Weather Report". 
     Format:
-    * **Macro Trend:** [Assess the NIFTY/Currency environment]
-    * **Micro Sentiment:** [Assess the specific stock's momentum vs SMA and read the news headlines]
-    * **Leverage Risk Level:** [Low/Medium/High - State if the environment is safe for holding debt, or if they should de-risk]
+    * **Macro Trend:** [Assess NIFTY, India VIX, and Broad News]
+    * **Micro Sentiment:** [Assess the stock's RSI momentum vs SMA and read the news headlines]
+    * **Leverage Risk Level:** [Low/Medium/High - State if the environment is safe for holding debt, or if they should accelerate de-risking]
     
     Keep it extremely brief and professional. No fluff.
     """
@@ -212,7 +244,6 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     if not api_key: return "⚠️ Error: Gemini API Key not found."
     
     trading_constraint = "CRITICAL: The user is an Active Employee. ALL stock sales MUST be explicitly scheduled during the '20-day quarterly trading windows' that open strictly 48 hours after financial results are published." if emp_status == "Active Employee" else "The user is an Ex-Employee. No blackout restrictions."
-    target_confidence = "VERIFIED INSTITUTIONAL DATA" if market_data['has_analyst_data'] else "ALGORITHMIC FALLBACK"
     
     state_context = f"""
     --- EXACT FINANCIAL STATE ---
@@ -236,7 +267,7 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
         Output a highly concise "Portfolio Health Check" containing:
         1. A 1-sentence assessment of Margin Call Risk vs Current Price.
         2. A 1-sentence assessment of their Tax State.
-        3. A 1-sentence strategic takeaway based on the "Market Weather Intelligence" (e.g., if market is bearish, tell them to consider de-risking faster).
+        3. A 1-sentence strategic takeaway based on the "Market Weather Intelligence" (e.g., if market fear/VIX is high, tell them to consider de-risking faster).
         
         End by asking the user to choose their primary intent:
         [A] Aggressive Debt Elimination
@@ -252,7 +283,7 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
         User replied: "{user_query}"
         
         Generate a mathematically precise, multi-tranche execution schedule. 
-        CRITICAL: Your schedule MUST adapt to the "Market Weather Intelligence". If the macro trend is risky, you must structure the tranches more defensively.
+        CRITICAL: Your schedule MUST adapt to the "Market Weather Intelligence". If the macro trend is risky or RSI is highly overbought/oversold, you must structure the tranches defensively to protect the user's capital.
         
         Format as:
         **Phase 1: [Name]**
@@ -325,24 +356,6 @@ else:
         strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
         danger_price = todays_debt / (total_shares * active_terms['margin_ltv'])
         
-        # --- NEW UI: THE INTELLIGENCE HUB ---
-        st.header("🌍 Macro & Market Intelligence")
-        macro_data = get_macro_context(ticker)
-        
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("NIFTY 50", f"{macro_data['nifty_price']:,.2f}")
-        col_m2.metric("USD / INR", f"₹{macro_data['usd_inr']:,.2f}")
-        col_m3.metric("3Mo Stock Volatility", f"{market_data['volatility']*100:.1f}%")
-        
-        with st.expander("📰 View Latest Ticker Headlines", expanded=False):
-            for headline in macro_data['news_headlines']: st.markdown(f"- {headline}")
-
-        with st.spinner("CIO Agent synthesizing market weather..."):
-            market_weather = synthesize_market_intelligence(ticker, market_data, macro_data)
-        st.info(f"**🧠 CIO Market Weather Report:**\n\n{market_weather}")
-        
-        st.divider()
-        
         # --- STANDARD EXECUTION UI ---
         st.header(f"Simulated Execution Status (Day {sim_days})")
         col1, col2, col3 = st.columns(3)
@@ -375,6 +388,35 @@ else:
         fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
         st.plotly_chart(fig_wealth, use_container_width=True)
         
+        # --- NEW LOCATION: THE INTELLIGENCE HUB ---
+        st.divider()
+        st.header("🌍 Macro & Market Intelligence")
+        macro_data = get_macro_context(ticker)
+        
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("NIFTY 50", f"{macro_data['nifty_price']:,.2f}")
+        col_m2.metric("India VIX (Fear Gauge)", f"{macro_data['india_vix']:,.2f}")
+        col_m3.metric("Stock RSI (14-Day)", f"{market_data.get('rsi_14', 50)}")
+        col_m4.metric("USD / INR", f"₹{macro_data['usd_inr']:,.2f}")
+        
+        col_news1, col_news2 = st.columns(2)
+        with col_news1:
+            with st.expander("📰 Broad Market News (Moneycontrol)", expanded=False):
+                if macro_data['moneycontrol_headlines']:
+                    for headline in macro_data['moneycontrol_headlines']: st.markdown(f"- {headline}")
+                else: st.markdown("- No recent headlines fetched.")
+        
+        with col_news2:
+            with st.expander(f"📰 {ticker} News (Google News)", expanded=False):
+                if macro_data['ticker_headlines']:
+                    for headline in macro_data['ticker_headlines']: st.markdown(f"- {headline}")
+                else: st.markdown("- No recent ticker headlines fetched.")
+
+        with st.spinner("CIO Agent synthesizing market weather..."):
+            market_weather = synthesize_market_intelligence(ticker, market_data, macro_data)
+        st.info(f"**🧠 CIO Market Weather Report:**\n\n{market_weather}")
+
+        # --- BOTTOM SECTION: INLINE CHAT ---
         st.divider()
         st.subheader("🧠 Interactive Algorithmic Execution Agent")
         tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, sim_days)
