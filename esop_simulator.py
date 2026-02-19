@@ -35,7 +35,7 @@ def calculate_nuvama_debt(principal: float, days_elapsed: int, prepayments: list
     return round(current_principal + total_fees_at_closure + total_interest, 2)
 
 # ==========================================
-# NODE 1.5: ADVANCED MARKET & GRANULAR DATA
+# NODE 1.5: ADVANCED MARKET & DATA PROVENANCE
 # ==========================================
 @st.cache_data(ttl=60)
 def get_market_data(ticker_symbol: str) -> dict:
@@ -53,9 +53,12 @@ def get_market_data(ticker_symbol: str) -> dict:
             sma_20 = current_price
             volatility = 0.25 
             
-        bull_target = info.get('targetHighPrice', current_price * 1.25)
-        base_target = info.get('targetMeanPrice', current_price * 1.10)
-        bear_target = info.get('targetLowPrice', current_price * 0.85)
+        # PROVENANCE TRACKER: Check if real analyst data exists
+        has_analyst_data = 'targetMeanPrice' in info and info['targetMeanPrice'] is not None
+        
+        bull_target = info.get('targetHighPrice') if has_analyst_data else current_price * 1.25
+        base_target = info.get('targetMeanPrice') if has_analyst_data else current_price * 1.10
+        bear_target = info.get('targetLowPrice') if has_analyst_data else current_price * 0.85
         
         return {
             "current_price": round(current_price, 2),
@@ -63,10 +66,11 @@ def get_market_data(ticker_symbol: str) -> dict:
             "base_target": round(base_target, 2),
             "bear_target": round(bear_target, 2),
             "sma_20": round(sma_20, 2),
-            "volatility": float(volatility)
+            "volatility": float(volatility),
+            "has_analyst_data": has_analyst_data
         }
     except:
-        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.25}
+        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.25, "has_analyst_data": False}
 
 # ==========================================
 # NODE 2: THE LIQUIDATION & TAX ENGINE
@@ -152,6 +156,9 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     
     trading_constraint = "SUBJECT TO STRICT 20-DAY QUARTERLY TRADING WINDOWS." if emp_status == "Active Employee" else "NO TRADING WINDOW RESTRICTIONS (Ex-Employee)."
     
+    # Let the AI know if the targets are real or algorithmic so it doesn't hallucinate confidence
+    target_confidence = "VERIFIED INSTITUTIONAL DATA" if market_data['has_analyst_data'] else "ALGORITHMIC FALLBACK (LOW CONFIDENCE)"
+    
     system_instruction = """
     You are an elite, UNBIASED quantitative wealth advisor. 
     YOUR DIRECTIVE: You MUST evaluate if holding the debt is mathematically superior to clearing it. 
@@ -170,7 +177,8 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     Status: {emp_status} | Rules: {trading_constraint}
     Total Shares: {total_shares:,} | Current Loan Debt: ₹{debt:,.2f}
     Current Price: ₹{market_data['current_price']:,.2f} | 20-Day SMA: ₹{market_data['sma_20']:,.2f}
-    Analyst 1Yr Targets -> Bull: ₹{market_data['bull_target']:,.2f} | Base: ₹{market_data['base_target']:,.2f} | Bear: ₹{market_data['bear_target']:,.2f}
+    Target Confidence: {target_confidence}
+    1Yr Targets -> Bull: ₹{market_data['bull_target']:,.2f} | Base: ₹{market_data['base_target']:,.2f} | Bear: ₹{market_data['bear_target']:,.2f}
     Current Tax Trigger: {tax_data['tax_type']}
     50% LTV Margin Call Price: ₹{margin_call:,.2f}
     """
@@ -258,7 +266,6 @@ else:
         col4.metric("Shares to Sell to Clear Debt", f"{strategy['shares_to_sell']:,}", delta_color="inverse")
         col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Gross Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
         
-        # RESTORED WARNING TEXT
         st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share. (If triggered, you have 7 days to cure the margin before forced liquidation).")
 
         # --- PLOTLY DUAL CHART ARCHITECTURE ---
@@ -266,15 +273,19 @@ else:
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
-        st.caption("Hover over any day to see the simulated price trajectory against Wall Street 1-Year targets.")
         
+        # PROVENANCE UI BADGE
+        if market_data['has_analyst_data']:
+            st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
+        else:
+            st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are unavailable for this ticker. Targets shown are simulated (+25% / +10% / -15%).")
+            
         fig_price = px.line(
             price_df.reset_index(), 
             x="Date", 
             y=["Simulated Price (₹)", "Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)"],
             color_discrete_sequence=["#0068C9", "#29B09D", "#7C3AED", "#FF4B4B"]
         )
-        # Cleaned up tooltip formatting
         fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
         fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
         st.plotly_chart(fig_price, use_container_width=True)
@@ -289,7 +300,6 @@ else:
             color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"],
             custom_data=["Underlying Share Price"]
         )
-        # Explicit override to strip "variable=" and append the Share Price cleanly
         fig_wealth.update_traces(hovertemplate="₹%{y:,.2f}  (Share Price: %{customdata[0]})")
         fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
         st.plotly_chart(fig_wealth, use_container_width=True)
