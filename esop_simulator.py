@@ -1,8 +1,10 @@
 import math
 import os
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import streamlit as st
+import datetime
 from google import genai
 from google.genai import types
 
@@ -32,7 +34,7 @@ def calculate_nuvama_debt(principal: float, days_elapsed: int, prepayments: list
     return round(current_principal + total_fees_at_closure + total_interest, 2)
 
 # ==========================================
-# NODE 1.5: THE MARKET FEED & TARGETS
+# NODE 1.5: ADVANCED MARKET & GRANULAR DATA
 # ==========================================
 @st.cache_data(ttl=60)
 def get_market_data(ticker_symbol: str) -> dict:
@@ -41,7 +43,15 @@ def get_market_data(ticker_symbol: str) -> dict:
         info = stock.info
         current_price = info.get('currentPrice', stock.fast_info['last_price'])
         
-        # Fetch Analyst Targets or use Quant Fallback for newly listed stocks
+        hist = stock.history(period="3mo")
+        if not hist.empty:
+            sma_20 = hist['Close'].rolling(window=20).mean().iloc[-1]
+            daily_returns = hist['Close'].pct_change().dropna()
+            volatility = daily_returns.std() * math.sqrt(252) 
+        else:
+            sma_20 = current_price
+            volatility = 0.40 
+            
         bull_target = info.get('targetHighPrice', current_price * 1.25)
         base_target = info.get('targetMeanPrice', current_price * 1.10)
         bear_target = info.get('targetLowPrice', current_price * 0.85)
@@ -50,10 +60,12 @@ def get_market_data(ticker_symbol: str) -> dict:
             "current_price": round(current_price, 2),
             "bull_target": round(bull_target, 2),
             "base_target": round(base_target, 2),
-            "bear_target": round(bear_target, 2)
+            "bear_target": round(bear_target, 2),
+            "sma_20": round(sma_20, 2),
+            "volatility": float(volatility)
         }
     except:
-        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0}
+        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.40}
 
 # ==========================================
 # NODE 2: THE LIQUIDATION & TAX ENGINE
@@ -77,31 +89,57 @@ def calculate_taxes(shares_sold: int, sell_price: float, fmv_on_exercise: float,
     return {"tax_type": "LTCG (12.5%)", "tax_liability": round(max(0, capital_gains - 125000) * 0.125, 2)}
 
 # ==========================================
-# NODE 2.5: THE PREDICTIVE PROJECTION ENGINE
+# NODE 2.5: GEOMETRIC BROWNIAN MOTION PROJECTION
 # ==========================================
-def generate_projection_data(principal: float, total_shares: int, market_data: dict, prepayments: list):
-    days = list(range(1, 366, 15)) # Sample every 15 days for a clean chart
+def generate_projection_data(principal: float, total_shares: int, fmv_on_exercise: float, market_data: dict, prepayments: list, sanction_date: datetime.date):
+    np.random.seed(42) 
+    days_to_sim = list(range(1, 400, 3)) 
     data = []
     
     p0 = market_data['current_price']
+    vol = market_data['volatility']
     
-    for d in days:
+    drift_base = math.log(market_data['base_target'] / p0) / 365
+    drift_bull = math.log(market_data['bull_target'] / p0) / 365
+    drift_bear = math.log(market_data['bear_target'] / p0) / 365
+    
+    price_base = p0
+    price_bull = p0
+    price_bear = p0
+    
+    for d in days_to_sim:
+        current_date = sanction_date + datetime.timedelta(days=d)
         debt = calculate_nuvama_debt(principal, d, prepayments)
         
-        # Linear price interpolation over 365 days towards analyst targets
-        base_price_d = p0 + ((market_data['base_target'] - p0) * (d / 365))
-        bull_price_d = p0 + ((market_data['bull_target'] - p0) * (d / 365))
-        bear_price_d = p0 + ((market_data['bear_target'] - p0) * (d / 365))
+        z = np.random.normal(0, 1)
+        step_vol = vol * math.sqrt(3/252)
         
+        if d > 1:
+            price_base *= math.exp(drift_base * 3 - 0.5 * step_vol**2 + step_vol * z)
+            price_bull *= math.exp(drift_bull * 3 - 0.5 * step_vol**2 + step_vol * z)
+            price_bear *= math.exp(drift_bear * 3 - 0.5 * step_vol**2 + step_vol * z)
+            
+        def get_true_net_wealth(sim_price):
+            gross_val = sim_price * total_shares
+            tax_hit = calculate_taxes(total_shares, sim_price, fmv_on_exercise, d)['tax_liability']
+            return gross_val - debt - tax_hit
+
+        # The exact net wealth line where Margin Call triggers (50% LTV)
+        # Margin call triggers when Gross Value = 2 * Debt. 
+        # Net wealth at that exact moment = (2 * Debt) - Debt - Taxes
+        margin_call_trigger_price = debt / (0.5 * total_shares)
+        tax_at_margin_call = calculate_taxes(total_shares, margin_call_trigger_price, fmv_on_exercise, d)['tax_liability']
+        net_wealth_at_margin_call = (2 * debt) - debt - tax_at_margin_call
+
         data.append({
-            "Day": d,
-            "Total Debt (₹)": debt,
-            "Base Portfolio Value (₹)": total_shares * base_price_d,
-            "Bull Portfolio Value (₹)": total_shares * bull_price_d,
-            "Bear Portfolio Value (₹)": total_shares * bear_price_d
+            "Date": current_date,
+            "Base Net Wealth": get_true_net_wealth(price_base),
+            "Bull Net Wealth": get_true_net_wealth(price_bull),
+            "Bear Net Wealth": get_true_net_wealth(price_bear),
+            "Margin Call Threshold": max(0, net_wealth_at_margin_call)
         })
         
-    return pd.DataFrame(data).set_index("Day")
+    return pd.DataFrame(data).set_index("Date")
 
 # ==========================================
 # NODE 4: THE UNBIASED QUANTITATIVE AGENT
@@ -113,9 +151,15 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     trading_constraint = "SUBJECT TO STRICT 20-DAY QUARTERLY TRADING WINDOWS." if emp_status == "Active Employee" else "NO TRADING WINDOW RESTRICTIONS (Ex-Employee)."
     
     system_instruction = """
-    You are an elite, unbiased quantitative wealth advisor. 
+    You are an elite, UNBIASED quantitative wealth advisor. 
     YOUR DIRECTIVE: You MUST evaluate if holding the debt is mathematically superior to clearing it. 
-    Compare the Nuvama interest rate (Max 9.25% p.a.) against the expected Analyst Target Yields and the STCG (20%) vs LTCG (12.5%) tax delta. Do NOT automatically suggest clearing the debt if holding the stock generates higher net wealth.
+    Compare the Nuvama interest rate (Max 9.25% p.a.) against the expected Analyst Target Yields and the STCG vs LTCG tax delta. 
+    
+    CRITICAL MARGIN CALL KNOWLEDGE: 
+    1. The margin call triggers when Total Debt exceeds 50% of the Pledged Portfolio Value.
+    2. If triggered, the user has a STRICT 7-DAY CURE PERIOD to regularize the account. 
+    3. Do NOT suggest immediate panic selling on a margin call. Advise utilizing the 7-day window to wait for price recovery or injecting external short-term cash to drop the LTV back under 50%.
+    
     Be extremely concise. Use short bullet points. Provide pure, actionable financial strategy.
     """
     
@@ -123,14 +167,14 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     --- FINANCIAL STATE & PREDICTIONS ---
     Status: {emp_status} | Rules: {trading_constraint}
     Total Shares: {total_shares:,} | Current Loan Debt: ₹{debt:,.2f}
-    Current Price: ₹{market_data['current_price']:,.2f}
+    Current Price: ₹{market_data['current_price']:,.2f} | 20-Day SMA: ₹{market_data['sma_20']:,.2f}
     Analyst 1Yr Targets -> Bull: ₹{market_data['bull_target']:,.2f} | Base: ₹{market_data['base_target']:,.2f} | Bear: ₹{market_data['bear_target']:,.2f}
     Current Tax Trigger: {tax_data['tax_type']}
-    Margin Call Price: ₹{margin_call:,.2f}
+    50% LTV Margin Call Price: ₹{margin_call:,.2f}
     """
     
     if is_default:
-        prompt = f"{system_instruction}\n{state_context}\nProvide the definitive, mathematically optimal baseline strategy. State clearly whether the user should HOLD (absorbing the 9.25% interest for upside/LTCG) or SELL (to de-risk and clear debt), and provide the tranche structure to execute your recommendation."
+        prompt = f"{system_instruction}\n{state_context}\nTake a step back. Provide an unbiased baseline strategy. State clearly whether the optimal quantitative play is to HOLD or SELL, and factor in the 7-day 50% LTV margin call reality into your risk assessment."
     else:
         prompt = f"{system_instruction}\n{state_context}\nThe user asks: '{user_query}'. Refine their strategy."
     
@@ -147,7 +191,7 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
 st.set_page_config(page_title="Smart ESOP Advisory", page_icon="📈", layout="wide")
 st.title("📈 Smart ESOP Investment & Advisory Platform")
 
-# --- SIDEBAR: Portfolio Configuration ---
+# --- SIDEBAR ---
 st.sidebar.header("⚙️ Portfolio Configuration")
 ticker = st.sidebar.text_input("Live Ticker Symbol", value="MEESHO.NS")
 emp_status = st.sidebar.radio("Employment Status", ["Active Employee", "Ex-Employee"])
@@ -178,8 +222,10 @@ if st.session_state.calc_breakdown: st.sidebar.info(st.session_state.calc_breakd
 
 principal_loan = st.sidebar.number_input("Total Loan Principal (₹)", min_value=0.0, value=float(st.session_state.principal_loan), step=10000.0)
 
-# RESTORED: The Interactive Simulation Slider
-days_held = st.sidebar.slider("Simulate Days Loan Held", min_value=1, max_value=400, value=1)
+loan_sanction_date = st.sidebar.date_input("Loan Sanction Date", datetime.date.today() - datetime.timedelta(days=1))
+days_held = max(1, (datetime.date.today() - loan_sanction_date).days)
+st.sidebar.caption(f"Days Loan Held: **{days_held} days**")
+sim_days = st.sidebar.slider("Simulate Future Date (Days Held)", min_value=1, max_value=400, value=days_held)
 
 st.sidebar.divider()
 st.sidebar.subheader("💸 Cash Injections (Multiple)")
@@ -191,15 +237,17 @@ prepayments_list = list(zip(edited_prepayments["Day"], edited_prepayments["Amoun
 if total_shares == 0 or principal_loan == 0:
     st.info("👋 Welcome. Please enter your Equity details and calculate your Loan Principal in the sidebar to begin.")
 else:
-    todays_debt = calculate_nuvama_debt(principal_loan, days_held, prepayments_list)
+    todays_debt = calculate_nuvama_debt(principal_loan, sim_days, prepayments_list)
     market_data = get_market_data(ticker)
     live_price = market_data['current_price']
 
     if live_price > 0:
         strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
         
-        # 1. TOP SECTION: Status at "Simulated Day X"
-        st.header(f"Simulated Execution Status (Day {days_held})")
+        # 50% LTV Margin Call Logic Update
+        danger_price = todays_debt / (total_shares * 0.5)
+        
+        st.header(f"Simulated Execution Status (Day {sim_days})")
         col1, col2, col3 = st.columns(3)
         col1.metric("Live Share Price", f"₹{live_price:,.2f}")
         col2.metric("Simulated Debt", f"₹{todays_debt:,.2f}")
@@ -208,23 +256,20 @@ else:
         st.divider()
         col4, col5 = st.columns(2)
         col4.metric("Shares to Sell to Clear Debt", f"{strategy['shares_to_sell']:,}", delta_color="inverse")
-        col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
+        col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Gross Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
         
-        # 2. MIDDLE SECTION: 1-Year Wealth Projection Chart
+        st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share. (If triggered, you have 7 days to cure the margin before forced liquidation).")
+
         st.divider()
-        st.subheader("📊 1-Year Wealth vs. Debt Projection")
-        st.caption(f"Based on 1Yr Analyst Targets -> Bull: ₹{market_data['bull_target']} | Base: ₹{market_data['base_target']} | Bear: ₹{market_data['bear_target']}")
+        st.subheader("📊 True Net Wealth Projection (Post-Tax & Debt)")
+        st.caption(f"This model maps the **50% LTV Margin Call Threshold**. If any portfolio line touches the red Margin Call line, your 7-day cure window begins.")
         
-        proj_df = generate_projection_data(principal_loan, total_shares, market_data, prepayments_list)
-        st.line_chart(proj_df, color=["#FF4B4B", "#0068C9", "#29B09D", "#FF8700"]) # Red for Debt, Cool colors for Portfolio
+        proj_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date)
+        st.line_chart(proj_df, color=["#0068C9", "#29B09D", "#FF8700", "#FF0000"]) 
         
-        # 3. BOTTOM SECTION: Goal Setting & Strategy Chat
         st.divider()
-        st.subheader("🧠 Quantitative Execution Plan")
-        
-        total_sell_margin = 0.0002 + 0.0002 + 0.001
-        danger_price = todays_debt / (total_shares * (1 - total_sell_margin))
-        tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, days_held)
+        st.subheader("🧠 Unbiased Quantitative Execution Plan")
+        tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, sim_days)
         
         if "messages" not in st.session_state:
             st.session_state.messages = []
@@ -236,7 +281,7 @@ else:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        if prompt := st.chat_input("Refine this strategy (e.g., 'What if the stock hits the Bear target next month?')"):
+        if prompt := st.chat_input("Refine this strategy (e.g., 'If a margin call triggers tomorrow, what is the optimal 7-day cure plan?')"):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
