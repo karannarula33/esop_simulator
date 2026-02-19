@@ -47,10 +47,11 @@ def get_market_data(ticker_symbol: str) -> dict:
         if not hist.empty:
             sma_20 = hist['Close'].rolling(window=20).mean().iloc[-1]
             daily_returns = hist['Close'].pct_change().dropna()
-            volatility = daily_returns.std() * math.sqrt(252) 
+            # Cap the baseline volatility so the projection doesn't simulate absurd extremes
+            volatility = min(daily_returns.std() * math.sqrt(252), 0.30)
         else:
             sma_20 = current_price
-            volatility = 0.40 
+            volatility = 0.25 
             
         bull_target = info.get('targetHighPrice', current_price * 1.25)
         base_target = info.get('targetMeanPrice', current_price * 1.10)
@@ -65,7 +66,7 @@ def get_market_data(ticker_symbol: str) -> dict:
             "volatility": float(volatility)
         }
     except:
-        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.40}
+        return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.25}
 
 # ==========================================
 # NODE 2: THE LIQUIDATION & TAX ENGINE
@@ -89,54 +90,49 @@ def calculate_taxes(shares_sold: int, sell_price: float, fmv_on_exercise: float,
     return {"tax_type": "LTCG (12.5%)", "tax_liability": round(max(0, capital_gains - 125000) * 0.125, 2)}
 
 # ==========================================
-# NODE 2.5: GEOMETRIC BROWNIAN MOTION PROJECTION
+# NODE 2.5: MEAN-REVERTING STOCHASTIC PROJECTION 
 # ==========================================
 def generate_projection_data(principal: float, total_shares: int, fmv_on_exercise: float, market_data: dict, prepayments: list, sanction_date: datetime.date):
-    np.random.seed(42) 
+    np.random.seed(42) # Anchor the simulation
     days_to_sim = list(range(1, 400, 3)) 
     data = []
     
     p0 = market_data['current_price']
+    target = market_data['base_target']
     vol = market_data['volatility']
     
-    drift_base = math.log(market_data['base_target'] / p0) / 365
-    drift_bull = math.log(market_data['bull_target'] / p0) / 365
-    drift_bear = math.log(market_data['bear_target'] / p0) / 365
-    
-    price_base = p0
-    price_bull = p0
-    price_bear = p0
+    current_sim_price = p0
+    daily_drift = math.log(target / p0) / 365
     
     for d in days_to_sim:
         current_date = sanction_date + datetime.timedelta(days=d)
         debt = calculate_nuvama_debt(principal, d, prepayments)
         
-        z = np.random.normal(0, 1)
-        step_vol = vol * math.sqrt(3/252)
-        
+        # Mean-reverting random walk towards analyst target
         if d > 1:
-            price_base *= math.exp(drift_base * 3 - 0.5 * step_vol**2 + step_vol * z)
-            price_bull *= math.exp(drift_bull * 3 - 0.5 * step_vol**2 + step_vol * z)
-            price_bear *= math.exp(drift_bear * 3 - 0.5 * step_vol**2 + step_vol * z)
+            step_vol = vol * math.sqrt(3/252)
+            z = np.random.normal(0, 1)
             
-        def get_true_net_wealth(sim_price):
-            gross_val = sim_price * total_shares
-            tax_hit = calculate_taxes(total_shares, sim_price, fmv_on_exercise, d)['tax_liability']
-            return gross_val - debt - tax_hit
-
-        # The exact net wealth line where Margin Call triggers (50% LTV)
-        # Margin call triggers when Gross Value = 2 * Debt. 
-        # Net wealth at that exact moment = (2 * Debt) - Debt - Taxes
-        margin_call_trigger_price = debt / (0.5 * total_shares)
-        tax_at_margin_call = calculate_taxes(total_shares, margin_call_trigger_price, fmv_on_exercise, d)['tax_liability']
-        net_wealth_at_margin_call = (2 * debt) - debt - tax_at_margin_call
+            # The "gravitational pull" to the linear expectation
+            linear_expectation = p0 + ((target - p0) / 365) * d
+            reversion = (linear_expectation - current_sim_price) * 0.08
+            
+            current_sim_price = current_sim_price * math.exp(daily_drift * 3 - 0.5 * step_vol**2 + step_vol * z) + reversion
+            
+        gross_value = current_sim_price * total_shares
+        
+        # The Gross Value where Debt exceeds 50% of the Portfolio (50% LTV Margin Call)
+        margin_call_level = debt / 0.5 
+        
+        tax_hit = calculate_taxes(total_shares, current_sim_price, fmv_on_exercise, d)['tax_liability']
+        net_wealth = max(0, gross_value - debt - tax_hit)
 
         data.append({
             "Date": current_date,
-            "Base Net Wealth": get_true_net_wealth(price_base),
-            "Bull Net Wealth": get_true_net_wealth(price_bull),
-            "Bear Net Wealth": get_true_net_wealth(price_bear),
-            "Margin Call Threshold": max(0, net_wealth_at_margin_call)
+            "Gross Portfolio Value (₹)": gross_value,
+            "Net Wealth (₹)": net_wealth,
+            "Margin Call Level (₹)": margin_call_level,
+            "Total Debt (₹)": debt
         })
         
     return pd.DataFrame(data).set_index("Date")
@@ -244,7 +240,6 @@ else:
     if live_price > 0:
         strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
         
-        # 50% LTV Margin Call Logic Update
         danger_price = todays_debt / (total_shares * 0.5)
         
         st.header(f"Simulated Execution Status (Day {sim_days})")
@@ -261,11 +256,13 @@ else:
         st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share. (If triggered, you have 7 days to cure the margin before forced liquidation).")
 
         st.divider()
-        st.subheader("📊 True Net Wealth Projection (Post-Tax & Debt)")
-        st.caption(f"This model maps the **50% LTV Margin Call Threshold**. If any portfolio line touches the red Margin Call line, your 7-day cure window begins.")
+        st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
+        st.caption("Hover over the chart to see your exact Gross Value, Net Wealth, Debt, and Margin Call Threshold on any future date. The model applies realistic market variance anchored to the consensus Analyst Base Target.")
         
         proj_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date)
-        st.line_chart(proj_df, color=["#0068C9", "#29B09D", "#FF8700", "#FF0000"]) 
+        
+        # Color mapping: Gross = Blue, Net = Green, Margin Level = Orange, Debt = Red
+        st.line_chart(proj_df, color=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"]) 
         
         st.divider()
         st.subheader("🧠 Unbiased Quantitative Execution Plan")
