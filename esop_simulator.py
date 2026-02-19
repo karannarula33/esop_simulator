@@ -47,7 +47,6 @@ def get_market_data(ticker_symbol: str) -> dict:
         if not hist.empty:
             sma_20 = hist['Close'].rolling(window=20).mean().iloc[-1]
             daily_returns = hist['Close'].pct_change().dropna()
-            # Cap the baseline volatility so the projection doesn't simulate absurd extremes
             volatility = min(daily_returns.std() * math.sqrt(252), 0.30)
         else:
             sma_20 = current_price
@@ -93,9 +92,11 @@ def calculate_taxes(shares_sold: int, sell_price: float, fmv_on_exercise: float,
 # NODE 2.5: MEAN-REVERTING STOCHASTIC PROJECTION 
 # ==========================================
 def generate_projection_data(principal: float, total_shares: int, fmv_on_exercise: float, market_data: dict, prepayments: list, sanction_date: datetime.date):
-    np.random.seed(42) # Anchor the simulation
+    np.random.seed(42) 
     days_to_sim = list(range(1, 400, 3)) 
-    data = []
+    
+    wealth_data = []
+    price_data = []
     
     p0 = market_data['current_price']
     target = market_data['base_target']
@@ -108,34 +109,37 @@ def generate_projection_data(principal: float, total_shares: int, fmv_on_exercis
         current_date = sanction_date + datetime.timedelta(days=d)
         debt = calculate_nuvama_debt(principal, d, prepayments)
         
-        # Mean-reverting random walk towards analyst target
         if d > 1:
             step_vol = vol * math.sqrt(3/252)
             z = np.random.normal(0, 1)
-            
-            # The "gravitational pull" to the linear expectation
             linear_expectation = p0 + ((target - p0) / 365) * d
             reversion = (linear_expectation - current_sim_price) * 0.08
-            
             current_sim_price = current_sim_price * math.exp(daily_drift * 3 - 0.5 * step_vol**2 + step_vol * z) + reversion
             
         gross_value = current_sim_price * total_shares
-        
-        # The Gross Value where Debt exceeds 50% of the Portfolio (50% LTV Margin Call)
         margin_call_level = debt / 0.5 
-        
         tax_hit = calculate_taxes(total_shares, current_sim_price, fmv_on_exercise, d)['tax_liability']
         net_wealth = max(0, gross_value - debt - tax_hit)
 
-        data.append({
+        # Store data for the Wealth Chart
+        wealth_data.append({
             "Date": current_date,
             "Gross Portfolio Value (₹)": gross_value,
             "Net Wealth (₹)": net_wealth,
-            "Margin Call Level (₹)": margin_call_level,
+            "Margin Call Threshold (₹)": margin_call_level,
             "Total Debt (₹)": debt
         })
         
-    return pd.DataFrame(data).set_index("Date")
+        # Store data for the Price Chart
+        price_data.append({
+            "Date": current_date,
+            "Simulated Price": current_sim_price,
+            "Bull Target": market_data['bull_target'],
+            "Base Target": market_data['base_target'],
+            "Bear Target": market_data['bear_target']
+        })
+        
+    return pd.DataFrame(wealth_data).set_index("Date"), pd.DataFrame(price_data).set_index("Date")
 
 # ==========================================
 # NODE 4: THE UNBIASED QUANTITATIVE AGENT
@@ -239,7 +243,6 @@ else:
 
     if live_price > 0:
         strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
-        
         danger_price = todays_debt / (total_shares * 0.5)
         
         st.header(f"Simulated Execution Status (Day {sim_days})")
@@ -253,17 +256,21 @@ else:
         col4.metric("Shares to Sell to Clear Debt", f"{strategy['shares_to_sell']:,}", delta_color="inverse")
         col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Gross Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
         
-        st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share. (If triggered, you have 7 days to cure the margin before forced liquidation).")
+        st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share.")
 
+        # --- DUAL CHART ARCHITECTURE ---
+        wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date)
+        
         st.divider()
+        st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
+        st.caption("Visualizing the simulated price trajectory against Wall Street 1-Year targets.")
+        st.line_chart(price_df, color=["#0068C9", "#29B09D", "#7C3AED", "#FF4B4B"]) 
+        
         st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
-        st.caption("Hover over the chart to see your exact Gross Value, Net Wealth, Debt, and Margin Call Threshold on any future date. The model applies realistic market variance anchored to the consensus Analyst Base Target.")
+        st.caption("Watch for the vertical 'step up' at month 12 when your tax burden drops to the 12.5% LTCG rate.")
+        st.line_chart(wealth_df, color=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"]) 
         
-        proj_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date)
-        
-        # Color mapping: Gross = Blue, Net = Green, Margin Level = Orange, Debt = Red
-        st.line_chart(proj_df, color=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"]) 
-        
+        # --- BOTTOM SECTION: INLINE CHAT ---
         st.divider()
         st.subheader("🧠 Unbiased Quantitative Execution Plan")
         tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, sim_days)
@@ -278,15 +285,17 @@ else:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        if prompt := st.chat_input("Refine this strategy (e.g., 'If a margin call triggers tomorrow, what is the optimal 7-day cure plan?')"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-                
-            with st.chat_message("assistant"):
-                with st.spinner("Recalculating strategy..."):
-                    response = generate_ai_insights(prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, is_default=False)
-                    st.markdown(response)
-                    st.session_state.messages.append({"role": "assistant", "content": response})
+        # Fixed Inline Form replacing the floating st.chat_input
+        with st.form("strategy_chat_form", clear_on_submit=True):
+            user_prompt = st.text_input("Refine this strategy with your quant advisor:", placeholder="e.g., How does this change if I need ₹10 Lakhs in cash next week?")
+            submitted = st.form_submit_button("Generate Strategic Response")
+            
+        if submitted and user_prompt:
+            st.session_state.messages.append({"role": "user", "content": user_prompt})
+            
+            with st.spinner("Recalculating strategy..."):
+                response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, is_default=False)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.rerun()
     else:
         st.error("Could not fetch live market data. Please check the ticker symbol.")
