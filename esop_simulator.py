@@ -23,8 +23,8 @@ FUNDING_PARTNERS = {
     "Bajaj Financial Securities": {
         "doc_fee": 0,
         "processing_fee_pct": 0.0020,
-        "margin_ltv": 0.50, # Standard fallback LTV
-        "cure_period_days": 7, # Standard fallback cure period
+        "margin_ltv": 0.50, 
+        "cure_period_days": 7, 
         "interest_tiers": [(30, 0.0725), (90, 0.085), (400, 0.0925)]
     },
     "Infina Finance": {
@@ -71,7 +71,7 @@ def calculate_loan_debt(principal: float, days_elapsed: int, prepayments: list, 
     return round(current_principal + total_fees_at_closure + total_interest, 2)
 
 # ==========================================
-# NODE 1.5: ADVANCED MARKET & DATA PROVENANCE
+# NODE 1.5 & 1.8: MACRO & MICRO DATA FETCHERS
 # ==========================================
 @st.cache_data(ttl=60)
 def get_market_data(ticker_symbol: str) -> dict:
@@ -90,22 +90,68 @@ def get_market_data(ticker_symbol: str) -> dict:
             volatility = 0.25 
             
         has_analyst_data = 'targetMeanPrice' in info and info['targetMeanPrice'] is not None
-        
         bull_target = info.get('targetHighPrice') if has_analyst_data else current_price * 1.25
         base_target = info.get('targetMeanPrice') if has_analyst_data else current_price * 1.10
         bear_target = info.get('targetLowPrice') if has_analyst_data else current_price * 0.85
         
         return {
-            "current_price": round(current_price, 2),
-            "bull_target": round(bull_target, 2),
-            "base_target": round(base_target, 2),
-            "bear_target": round(bear_target, 2),
-            "sma_20": round(sma_20, 2),
-            "volatility": float(volatility),
-            "has_analyst_data": has_analyst_data
+            "current_price": round(current_price, 2), "bull_target": round(bull_target, 2),
+            "base_target": round(base_target, 2), "bear_target": round(bear_target, 2),
+            "sma_20": round(sma_20, 2), "volatility": float(volatility), "has_analyst_data": has_analyst_data
         }
     except:
         return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.25, "has_analyst_data": False}
+
+@st.cache_data(ttl=1800) # Fetch macro data every 30 mins
+def get_macro_context(ticker_symbol: str) -> dict:
+    macro_data = {"nifty_price": 0.0, "usd_inr": 0.0, "news_headlines": []}
+    try:
+        nifty = yf.Ticker('^NSEI').fast_info['last_price']
+        macro_data["nifty_price"] = round(nifty, 2)
+    except: pass
+    try:
+        usd = yf.Ticker('INR=X').fast_info['last_price']
+        macro_data["usd_inr"] = round(usd, 2)
+    except: pass
+    try:
+        raw_news = yf.Ticker(ticker_symbol).news[:4]
+        macro_data["news_headlines"] = [f"{n['title']} ({n.get('publisher', 'News')})" for n in raw_news] if raw_news else ["No recent major headlines detected."]
+    except:
+        macro_data["news_headlines"] = ["News feed temporarily unavailable."]
+    return macro_data
+
+# ==========================================
+# NODE 5: THE MARKET INTELLIGENCE SYNTHESIZER
+# ==========================================
+@st.cache_data(ttl=3600) # Cache the AI macro analysis for 1 hour to save tokens
+def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: dict) -> str:
+    api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
+    if not api_key: return "⚠️ Setup required: Gemini API Key not found."
+    
+    prompt = f"""
+    You are a Chief Investment Officer analyzing a specific stock ({ticker}) for an employee holding leveraged ESOPs.
+    
+    RAW DATA:
+    - Current Stock Price: ₹{market_data['current_price']}
+    - 20-Day Moving Average: ₹{market_data['sma_20']}
+    - NIFTY 50 Index: {macro_data['nifty_price']}
+    - USD/INR Rate: {macro_data['usd_inr']}
+    - Latest News Headlines: {macro_data['news_headlines']}
+    
+    Synthesize this into a crisp, 3-bullet "Market Weather Report". 
+    Format:
+    * **Macro Trend:** [Assess the NIFTY/Currency environment]
+    * **Micro Sentiment:** [Assess the specific stock's momentum vs SMA and read the news headlines]
+    * **Leverage Risk Level:** [Low/Medium/High - State if the environment is safe for holding debt, or if they should de-risk]
+    
+    Keep it extremely brief and professional. No fluff.
+    """
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(model='gemini-2.5-pro', contents=prompt)
+        return response.text
+    except Exception as e:
+        return f"⚠️ Intelligence Engine Offline: {str(e)}"
 
 # ==========================================
 # NODE 2: THE LIQUIDATION & TAX ENGINE
@@ -116,10 +162,8 @@ def calculate_liquidation_strategy(daily_debt: float, share_price: float, total_
     net_realization_per_share = share_price * (1 - total_sell_margin)
     shares_to_sell = math.ceil(daily_debt / net_realization_per_share)
     return {
-        "net_pocketed": net_realization_per_share,
-        "shares_to_sell": shares_to_sell,
-        "remaining_shares": total_shares - shares_to_sell,
-        "unlocked_wealth": (total_shares - shares_to_sell) * share_price
+        "net_pocketed": net_realization_per_share, "shares_to_sell": shares_to_sell,
+        "remaining_shares": total_shares - shares_to_sell, "unlocked_wealth": (total_shares - shares_to_sell) * share_price
     }
 
 def calculate_taxes(shares_sold: int, sell_price: float, fmv_on_exercise: float, holding_days: int) -> dict:
@@ -134,16 +178,10 @@ def calculate_taxes(shares_sold: int, sell_price: float, fmv_on_exercise: float,
 def generate_projection_data(principal: float, total_shares: int, fmv_on_exercise: float, market_data: dict, prepayments: list, sanction_date: datetime.date, terms: dict):
     np.random.seed(42) 
     days_to_sim = list(range(1, 400, 3)) 
-    
-    wealth_data = []
-    price_data = []
-    
-    p0 = market_data['current_price']
-    target = market_data['base_target']
-    vol = market_data['volatility']
-    
+    wealth_data, price_data = [], []
+    p0, target, vol = market_data['current_price'], market_data['base_target'], market_data['volatility']
     current_sim_price = p0
-    daily_drift = math.log(target / p0) / 365
+    daily_drift = math.log(target / p0) / 365 if p0 > 0 else 0
     
     for d in days_to_sim:
         current_date = sanction_date + datetime.timedelta(days=d)
@@ -157,77 +195,53 @@ def generate_projection_data(principal: float, total_shares: int, fmv_on_exercis
             current_sim_price = current_sim_price * math.exp(daily_drift * 3 - 0.5 * step_vol**2 + step_vol * z) + reversion
             
         gross_value = current_sim_price * total_shares
-        
-        # Margin call level is dynamically driven by the specific partner's LTV rules
         margin_call_level = debt / terms["margin_ltv"]
-        
         tax_hit = calculate_taxes(total_shares, current_sim_price, fmv_on_exercise, d)['tax_liability']
         net_wealth = max(0, gross_value - debt - tax_hit)
 
-        formatted_price = f"₹{current_sim_price:,.2f}"
-
-        wealth_data.append({
-            "Date": current_date,
-            "Gross Portfolio Value (₹)": gross_value,
-            "Net Wealth (₹)": net_wealth,
-            "Margin Call Threshold (₹)": margin_call_level,
-            "Total Debt (₹)": debt,
-            "Underlying Share Price": formatted_price
-        })
-        
-        price_data.append({
-            "Date": current_date,
-            "Simulated Price (₹)": current_sim_price,
-            "Bull Target (₹)": market_data['bull_target'],
-            "Base Target (₹)": market_data['base_target'],
-            "Bear Target (₹)": market_data['bear_target']
-        })
+        wealth_data.append({"Date": current_date, "Gross Portfolio Value (₹)": gross_value, "Net Wealth (₹)": net_wealth, "Margin Call Threshold (₹)": margin_call_level, "Total Debt (₹)": debt, "Underlying Share Price": f"₹{current_sim_price:,.2f}"})
+        price_data.append({"Date": current_date, "Simulated Price (₹)": current_sim_price, "Bull Target (₹)": market_data['bull_target'], "Base Target (₹)": market_data['base_target'], "Bear Target (₹)": market_data['bear_target']})
         
     return pd.DataFrame(wealth_data).set_index("Date"), pd.DataFrame(price_data).set_index("Date")
 
 # ==========================================
-# NODE 4: THE INTERACTIVE QUANTITATIVE AGENT
+# NODE 4: THE CROSS-COMMUNICATING AGENT
 # ==========================================
-def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, debt: float, market_data: dict, strategy: dict, margin_call: float, tax_data: dict, days_held: int, partner_name: str, terms: dict, is_default: bool = False):
+def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, debt: float, market_data: dict, strategy: dict, margin_call: float, tax_data: dict, days_held: int, partner_name: str, terms: dict, market_intelligence: str, is_default: bool = False):
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key: return "⚠️ Error: Gemini API Key not found."
     
-    trading_constraint = "CRITICAL: The user is an Active Employee. ALL stock sales MUST be explicitly scheduled during the '20-day quarterly trading windows' that open strictly 48 hours after financial results are published. Do not suggest selling outside these windows." if emp_status == "Active Employee" else "The user is an Ex-Employee. There are no trading window blackout restrictions. They can execute limit orders on any trading day."
-    target_confidence = "VERIFIED INSTITUTIONAL DATA" if market_data['has_analyst_data'] else "ALGORITHMIC FALLBACK (LOW CONFIDENCE)"
+    trading_constraint = "CRITICAL: The user is an Active Employee. ALL stock sales MUST be explicitly scheduled during the '20-day quarterly trading windows' that open strictly 48 hours after financial results are published." if emp_status == "Active Employee" else "The user is an Ex-Employee. No blackout restrictions."
+    target_confidence = "VERIFIED INSTITUTIONAL DATA" if market_data['has_analyst_data'] else "ALGORITHMIC FALLBACK"
     
     state_context = f"""
     --- EXACT FINANCIAL STATE ---
-    Funding Partner: {partner_name}
-    Partner Margin Call LTV: {terms['margin_ltv']*100}%
-    Partner Cure Period: {terms['cure_period_days']} days
-    Total Shares: {total_shares:,} | Current Loan Debt: ₹{debt:,.2f} | Days Loan Held: {days_held}
-    Current Price: ₹{market_data['current_price']:,.2f} | 20-Day SMA: ₹{market_data['sma_20']:,.2f}
-    Target Confidence: {target_confidence}
-    1Yr Targets -> Bull: ₹{market_data['bull_target']:,.2f} | Base: ₹{market_data['base_target']:,.2f} | Bear: ₹{market_data['bear_target']:,.2f}
-    Current Tax Trigger: {tax_data['tax_type']} (Liability: ₹{tax_data['tax_liability']:,.2f})
-    Margin Call Price: ₹{margin_call:,.2f}
-    Minimum Shares to clear debt today: {strategy.get('shares_to_sell', 0):,}
+    Partner: {partner_name} | LTV: {terms['margin_ltv']*100}% | Cure Period: {terms['cure_period_days']} days
+    Total Shares: {total_shares:,} | Debt: ₹{debt:,.2f} | Days Held: {days_held}
+    Current Price: ₹{market_data['current_price']:,.2f}
+    Tax Trigger: {tax_data['tax_type']} (Liability: ₹{tax_data['tax_liability']:,.2f})
+    Margin Call Trigger: ₹{margin_call:,.2f}
+    
+    --- MARKET WEATHER INTELLIGENCE (FROM CIO) ---
+    {market_intelligence}
     """
     
     if is_default:
         prompt = f"""
         You are an elite quantitative wealth advisor. 
-        Evaluate the following state:
+        Read this state and the Market Weather Intelligence carefully:
         {state_context}
         Rules: {trading_constraint}
         
-        DO NOT GENERATE A PHASED SCHEDULE YET.
+        Output a highly concise "Portfolio Health Check" containing:
+        1. A 1-sentence assessment of Margin Call Risk vs Current Price.
+        2. A 1-sentence assessment of their Tax State.
+        3. A 1-sentence strategic takeaway based on the "Market Weather Intelligence" (e.g., if market is bearish, tell them to consider de-risking faster).
         
-        Instead, output a highly concise "Portfolio Health Check" containing:
-        1. A 1-sentence assessment of their Margin Call Risk (Factoring in the exact partner LTV and cure period).
-        2. A 1-sentence assessment of their Tax State (STCG vs LTCG).
-        
-        Then, end your response by asking the user a multiple-choice question to determine their primary strategic intent so you can build the right schedule. Provide these 3 options:
-        [A] Aggressive Debt Elimination (I want to be debt-free ASAP)
-        [B] Maximize Long-Term Wealth (I am willing to hold the loan to get LTCG tax benefits and stock upside)
-        [C] External Capital Extraction (I need to liquidate a specific amount for a startup, real estate, etc.)
-        
-        Keep this incredibly brief.
+        End by asking the user to choose their primary intent:
+        [A] Aggressive Debt Elimination
+        [B] Maximize Long-Term Wealth 
+        [C] External Capital Extraction
         """
     else:
         prompt = f"""
@@ -235,21 +249,17 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
         {state_context}
         Rules: {trading_constraint}
         
-        The user replied with: "{user_query}"
+        User replied: "{user_query}"
         
-        Based on their chosen intent, generate a mathematically precise, multi-tranche execution schedule. 
-        Do not provide vague advice. Calculate exact share quantities and explicit target prices based on the specific partner's interest rates and cure terms.
+        Generate a mathematically precise, multi-tranche execution schedule. 
+        CRITICAL: Your schedule MUST adapt to the "Market Weather Intelligence". If the macro trend is risky, you must structure the tranches more defensively.
         
-        Format your response as:
-        **Phase 1: [Name tailored to their goal]**
+        Format as:
+        **Phase 1: [Name]**
         * Action: [Sell X / Hold]
-        * Timing: [Specific Timing factoring in Trading Windows and the 365-day LTCG cliff]
+        * Timing: [Specific Timing]
         * Target Price: [Rupee Value]
-        
-        **Phase 2: [Name tailored to their goal]**
-        ... etc.
         """
-    
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(model='gemini-2.5-pro', contents=prompt)
@@ -263,7 +273,6 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
 st.set_page_config(page_title="Smart ESOP Advisory", page_icon="📈", layout="wide")
 st.title("📈 Smart ESOP Investment & Advisory Platform")
 
-# --- SIDEBAR ---
 st.sidebar.header("⚙️ Portfolio Configuration")
 ticker = st.sidebar.text_input("Live Ticker Symbol", value="MEESHO.NS")
 emp_status = st.sidebar.radio("Employment Status", ["Active Employee", "Ex-Employee"])
@@ -275,7 +284,6 @@ active_terms = FUNDING_PARTNERS[selected_partner]
 
 st.sidebar.divider()
 st.sidebar.subheader("🧮 Loan & Equity Calculator")
-
 vested_options = st.sidebar.number_input("Total Vested Options (ESOPs)", min_value=0, value=0, step=100)
 total_shares = st.sidebar.number_input("Total Resulting Shares", min_value=0, value=0, step=100)
 fmv_on_exercise = st.sidebar.number_input("FMV on Exercise Date (₹)", min_value=0.0, value=130.0, step=1.0)
@@ -289,19 +297,15 @@ if st.sidebar.button("Calculate Exact Loan Needed"):
         perq_value = (total_shares * fmv_on_exercise) - exercise_payable
         tax_rate = 0.30 if emp_status == "Active Employee" else 0.4274
         perq_tax = perq_value * tax_rate
-        
         st.session_state.principal_loan = round(exercise_payable + perq_tax, 2)
         st.session_state.calc_breakdown = f"**Calculation Breakdown:**\n- Exercise Price: ₹{exercise_payable:,.2f}\n- Perquisite Value: ₹{perq_value:,.2f}\n- Perquisite Tax ({tax_rate*100}%): ₹{perq_tax:,.2f}\n- **Total Loan: ₹{st.session_state.principal_loan:,.2f}**"
-    else:
-        st.sidebar.warning("Enter Options, Shares, and FMV first.")
+    else: st.sidebar.warning("Enter Options, Shares, and FMV first.")
 
 if st.session_state.calc_breakdown: st.sidebar.info(st.session_state.calc_breakdown)
 
 principal_loan = st.sidebar.number_input("Total Loan Principal (₹)", min_value=0.0, value=float(st.session_state.principal_loan), step=10000.0)
-
 loan_sanction_date = st.sidebar.date_input("Loan Sanction Date", datetime.date.today() - datetime.timedelta(days=1))
 days_held = max(1, (datetime.date.today() - loan_sanction_date).days)
-st.sidebar.caption(f"Days Loan Held: **{days_held} days**")
 sim_days = st.sidebar.slider("Simulate Future Date (Days Held)", min_value=1, max_value=400, value=days_held)
 
 st.sidebar.divider()
@@ -310,7 +314,6 @@ if 'prepayments_df' not in st.session_state: st.session_state.prepayments_df = p
 edited_prepayments = st.sidebar.data_editor(st.session_state.prepayments_df, num_rows="dynamic", hide_index=True)
 prepayments_list = list(zip(edited_prepayments["Day"], edited_prepayments["Amount (₹)"]))
 
-# --- MAIN DASHBOARD ---
 if total_shares == 0 or principal_loan == 0:
     st.info("👋 Welcome. Please enter your Equity details and calculate your Loan Principal in the sidebar to begin.")
 else:
@@ -320,9 +323,27 @@ else:
 
     if live_price > 0:
         strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
-        
         danger_price = todays_debt / (total_shares * active_terms['margin_ltv'])
         
+        # --- NEW UI: THE INTELLIGENCE HUB ---
+        st.header("🌍 Macro & Market Intelligence")
+        macro_data = get_macro_context(ticker)
+        
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("NIFTY 50", f"{macro_data['nifty_price']:,.2f}")
+        col_m2.metric("USD / INR", f"₹{macro_data['usd_inr']:,.2f}")
+        col_m3.metric("3Mo Stock Volatility", f"{market_data['volatility']*100:.1f}%")
+        
+        with st.expander("📰 View Latest Ticker Headlines", expanded=False):
+            for headline in macro_data['news_headlines']: st.markdown(f"- {headline}")
+
+        with st.spinner("CIO Agent synthesizing market weather..."):
+            market_weather = synthesize_market_intelligence(ticker, market_data, macro_data)
+        st.info(f"**🧠 CIO Market Weather Report:**\n\n{market_weather}")
+        
+        st.divider()
+        
+        # --- STANDARD EXECUTION UI ---
         st.header(f"Simulated Execution Status (Day {sim_days})")
         col1, col2, col3 = st.columns(3)
         col1.metric("Live Share Price", f"₹{live_price:,.2f}")
@@ -340,45 +361,28 @@ else:
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
-        
-        if market_data['has_analyst_data']:
-            st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
-        else:
-            st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are unavailable for this ticker. Targets shown are simulated (+25% / +10% / -15%).")
+        if market_data['has_analyst_data']: st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
+        else: st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are unavailable for this ticker.")
             
-        fig_price = px.line(
-            price_df.reset_index(), 
-            x="Date", 
-            y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"],
-            color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"]
-        )
+        fig_price = px.line(price_df.reset_index(), x="Date", y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"], color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"])
         fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
         fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
         st.plotly_chart(fig_price, use_container_width=True)
         
         st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
-        st.caption("Notice the vertical 'step up' at month 12 when your tax burden drops to the 12.5% LTCG rate.")
-        
-        fig_wealth = px.line(
-            wealth_df.reset_index(), 
-            x="Date", 
-            y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Call Threshold (₹)", "Total Debt (₹)"],
-            color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"],
-            custom_data=["Underlying Share Price"]
-        )
+        fig_wealth = px.line(wealth_df.reset_index(), x="Date", y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Call Threshold (₹)", "Total Debt (₹)"], color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"], custom_data=["Underlying Share Price"])
         fig_wealth.update_traces(hovertemplate="₹%{y:,.2f}  (Share Price: %{customdata[0]})")
         fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
         st.plotly_chart(fig_wealth, use_container_width=True)
         
-        # --- BOTTOM SECTION: INLINE CHAT ---
         st.divider()
         st.subheader("🧠 Interactive Algorithmic Execution Agent")
         tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, sim_days)
         
         if "messages" not in st.session_state:
             st.session_state.messages = []
-            with st.spinner("Analyzing portfolio health..."):
-                baseline_plan = generate_ai_insights("", emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, is_default=True)
+            with st.spinner("Analyzing portfolio health against Macro conditions..."):
+                baseline_plan = generate_ai_insights("", emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, market_weather, is_default=True)
                 st.session_state.messages.append({"role": "assistant", "content": f"{baseline_plan}"})
                 
         for message in st.session_state.messages:
@@ -391,8 +395,8 @@ else:
             
         if submitted and user_prompt:
             st.session_state.messages.append({"role": "user", "content": user_prompt})
-            with st.spinner("Calculating precision tranches based on your objective..."):
-                response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, is_default=False)
+            with st.spinner("Calculating precision tranches..."):
+                response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, market_weather, is_default=False)
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 st.rerun()
     else:
