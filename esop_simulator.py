@@ -53,7 +53,6 @@ def get_market_data(ticker_symbol: str) -> dict:
             sma_20 = current_price
             volatility = 0.25 
             
-        # PROVENANCE TRACKER: Check if real analyst data exists
         has_analyst_data = 'targetMeanPrice' in info and info['targetMeanPrice'] is not None
         
         bull_target = info.get('targetHighPrice') if has_analyst_data else current_price * 1.25
@@ -148,45 +147,68 @@ def generate_projection_data(principal: float, total_shares: int, fmv_on_exercis
     return pd.DataFrame(wealth_data).set_index("Date"), pd.DataFrame(price_data).set_index("Date")
 
 # ==========================================
-# NODE 4: THE UNBIASED QUANTITATIVE AGENT
+# NODE 4: THE INTERACTIVE QUANTITATIVE AGENT
 # ==========================================
-def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, debt: float, market_data: dict, strategy: dict, margin_call: float, tax_data: dict, is_default: bool = False):
+def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, debt: float, market_data: dict, strategy: dict, margin_call: float, tax_data: dict, days_held: int, is_default: bool = False):
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key: return "⚠️ Error: Gemini API Key not found."
     
-    trading_constraint = "SUBJECT TO STRICT 20-DAY QUARTERLY TRADING WINDOWS." if emp_status == "Active Employee" else "NO TRADING WINDOW RESTRICTIONS (Ex-Employee)."
-    
-    # Let the AI know if the targets are real or algorithmic so it doesn't hallucinate confidence
+    # 1. Strict explicit constraints based on UI toggles
+    trading_constraint = "CRITICAL: The user is an Active Employee. ALL stock sales MUST be explicitly scheduled during the '20-day quarterly trading windows' that open strictly 48 hours after financial results are published. Do not suggest selling outside these windows." if emp_status == "Active Employee" else "The user is an Ex-Employee. There are no trading window blackout restrictions. They can execute limit orders on any trading day."
     target_confidence = "VERIFIED INSTITUTIONAL DATA" if market_data['has_analyst_data'] else "ALGORITHMIC FALLBACK (LOW CONFIDENCE)"
     
-    system_instruction = """
-    You are an elite, UNBIASED quantitative wealth advisor. 
-    YOUR DIRECTIVE: You MUST evaluate if holding the debt is mathematically superior to clearing it. 
-    Compare the Nuvama interest rate (Max 9.25% p.a.) against the expected Analyst Target Yields and the STCG vs LTCG tax delta. 
-    
-    CRITICAL MARGIN CALL KNOWLEDGE: 
-    1. The margin call triggers when Total Debt exceeds 50% of the Pledged Portfolio Value.
-    2. If triggered, the user has a STRICT 7-DAY CURE PERIOD to regularize the account. 
-    3. Do NOT suggest immediate panic selling on a margin call. Advise utilizing the 7-day window to wait for price recovery or injecting external short-term cash to drop the LTV back under 50%.
-    
-    Be extremely concise. Use short bullet points. Provide pure, actionable financial strategy.
-    """
-    
     state_context = f"""
-    --- FINANCIAL STATE & PREDICTIONS ---
-    Status: {emp_status} | Rules: {trading_constraint}
-    Total Shares: {total_shares:,} | Current Loan Debt: ₹{debt:,.2f}
+    --- EXACT FINANCIAL STATE ---
+    Total Shares: {total_shares:,} | Current Loan Debt: ₹{debt:,.2f} | Days Loan Held: {days_held}
     Current Price: ₹{market_data['current_price']:,.2f} | 20-Day SMA: ₹{market_data['sma_20']:,.2f}
     Target Confidence: {target_confidence}
     1Yr Targets -> Bull: ₹{market_data['bull_target']:,.2f} | Base: ₹{market_data['base_target']:,.2f} | Bear: ₹{market_data['bear_target']:,.2f}
-    Current Tax Trigger: {tax_data['tax_type']}
+    Current Tax Trigger: {tax_data['tax_type']} (Liability: ₹{tax_data['tax_liability']:,.2f})
     50% LTV Margin Call Price: ₹{margin_call:,.2f}
+    Minimum Shares to clear debt today: {strategy.get('shares_to_sell', 0):,}
     """
     
+    # 2. Dynamic Prompting based on Interaction State
     if is_default:
-        prompt = f"{system_instruction}\n{state_context}\nTake a step back. Provide an unbiased baseline strategy. State clearly whether the optimal quantitative play is to HOLD or SELL, and factor in the 7-day 50% LTV margin call reality into your risk assessment."
+        prompt = f"""
+        You are an elite quantitative wealth advisor. 
+        Evaluate the following state:
+        {state_context}
+        Rules: {trading_constraint}
+        
+        DO NOT GENERATE A PHASED SCHEDULE YET.
+        
+        Instead, output a highly concise "Portfolio Health Check" containing:
+        1. A 1-sentence assessment of their Margin Call Risk.
+        2. A 1-sentence assessment of their Tax State (STCG vs LTCG).
+        
+        Then, end your response by asking the user a multiple-choice question to determine their primary strategic intent so you can build the right schedule. Provide these 3 options:
+        [A] Aggressive Debt Elimination (I want to be debt-free ASAP)
+        [B] Maximize Long-Term Wealth (I am willing to hold the loan to get LTCG tax benefits and stock upside)
+        [C] External Capital Extraction (I need to liquidate a specific amount for a startup, real estate, etc.)
+        
+        Keep this incredibly brief.
+        """
     else:
-        prompt = f"{system_instruction}\n{state_context}\nThe user asks: '{user_query}'. Refine their strategy."
+        prompt = f"""
+        You are an elite, algorithmic execution engine.
+        {state_context}
+        Rules: {trading_constraint}
+        
+        The user replied with: "{user_query}"
+        
+        Based on their chosen intent, generate a mathematically precise, multi-tranche execution schedule. 
+        Do not provide vague advice. Calculate exact share quantities and explicit target prices.
+        
+        Format your response as:
+        **Phase 1: [Name tailored to their goal]**
+        * Action: [Sell X / Hold]
+        * Timing: [Specific Timing factoring in Trading Windows and the 365-day LTCG cliff]
+        * Target Price: [Rupee Value]
+        
+        **Phase 2: [Name tailored to their goal]**
+        ... etc.
+        """
     
     try:
         client = genai.Client(api_key=api_key)
@@ -266,15 +288,13 @@ else:
         col4.metric("Shares to Sell to Clear Debt", f"{strategy['shares_to_sell']:,}", delta_color="inverse")
         col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Gross Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
         
-        st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share. (If triggered, you have 7 days to cure the margin before forced liquidation).")
+        st.warning(f"🚨 **50% LTV Margin Call Threshold:** ₹{danger_price:,.2f} per share. (If your stock drops to this price, your loan LTV hits 50%. You then have a strict 7-day cure window to inject cash or sell before forced liquidation).")
 
-        # --- PLOTLY DUAL CHART ARCHITECTURE ---
         wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, prepayments_list, loan_sanction_date)
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
         
-        # PROVENANCE UI BADGE
         if market_data['has_analyst_data']:
             st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
         else:
@@ -283,8 +303,8 @@ else:
         fig_price = px.line(
             price_df.reset_index(), 
             x="Date", 
-            y=["Simulated Price (₹)", "Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)"],
-            color_discrete_sequence=["#0068C9", "#29B09D", "#7C3AED", "#FF4B4B"]
+            y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"],
+            color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"]
         )
         fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
         fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
@@ -306,27 +326,27 @@ else:
         
         # --- BOTTOM SECTION: INLINE CHAT ---
         st.divider()
-        st.subheader("🧠 Unbiased Quantitative Execution Plan")
+        st.subheader("🧠 Interactive Algorithmic Execution Agent")
         tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, sim_days)
         
         if "messages" not in st.session_state:
             st.session_state.messages = []
-            with st.spinner("Computing unbiased baseline strategy..."):
-                baseline_plan = generate_ai_insights("", emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, is_default=True)
-                st.session_state.messages.append({"role": "assistant", "content": f"**Unbiased Baseline Strategy Generated:**\n\n{baseline_plan}"})
+            with st.spinner("Analyzing portfolio health..."):
+                baseline_plan = generate_ai_insights("", emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, is_default=True)
+                st.session_state.messages.append({"role": "assistant", "content": f"{baseline_plan}"})
                 
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
         with st.form("strategy_chat_form", clear_on_submit=True):
-            user_prompt = st.text_input("Refine this strategy with your quant advisor:", placeholder="e.g., How does this change if I need ₹10 Lakhs in cash next week?")
-            submitted = st.form_submit_button("Generate Strategic Response")
+            user_prompt = st.text_input("Reply with A, B, C, or type a custom goal:", placeholder="e.g., 'C - I need ₹20 Lakhs in exactly 4 months.'")
+            submitted = st.form_submit_button("Generate Strategic Schedule")
             
         if submitted and user_prompt:
             st.session_state.messages.append({"role": "user", "content": user_prompt})
-            with st.spinner("Recalculating strategy..."):
-                response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, is_default=False)
+            with st.spinner("Calculating precision tranches based on your objective..."):
+                response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, is_default=False)
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 st.rerun()
     else:
