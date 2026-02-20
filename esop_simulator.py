@@ -135,11 +135,10 @@ def calculate_rsi(prices, period=14):
     rs = up.ewm(com=period-1, adjust=False).mean() / down.ewm(com=period-1, adjust=False).mean()
     return round((100 - (100 / (1 + rs))).iloc[-1], 2)
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300) # Short 5-min cache for highly active stock data
 def get_market_data(ticker_symbol: str) -> dict:
     try:
         stock = yf.Ticker(ticker_symbol)
-        # Using fast_info directly to prevent Yahoo Finance API blocks on listed entities
         current_price = float(stock.fast_info['last_price'])
         
         hist = stock.history(period="3mo")
@@ -161,10 +160,8 @@ def get_market_data(ticker_symbol: str) -> dict:
             bull, base, bear = current_price * 1.25, current_price * 1.10, current_price * 0.85
         
         return {
-            "current_price": round(current_price, 2), 
-            "bull_target": round(bull, 2),
-            "base_target": round(base, 2), 
-            "bear_target": round(bear, 2),
+            "current_price": round(current_price, 2), "bull_target": round(bull, 2),
+            "base_target": round(base, 2), "bear_target": round(bear, 2),
             "sma_20": round(sma_20, 2), "volatility": float(volatility), 
             "rsi_14": rsi_14, "has_analyst_data": has_analyst
         }
@@ -181,7 +178,7 @@ def get_rss_news(url, max_items=4):
         return [item.find('title').text for item in root.findall('.//item')[:max_items] if item.find('title') is not None]
     except: return []
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=900) # 15-min cache to ensure news updates frequently
 def get_macro_context(ticker_symbol: str) -> dict:
     macro_data = {"nifty_price": 0.0, "usd_inr": 0.0, "india_vix": 0.0, "mc_news": [], "ticker_news": []}
     try: macro_data["nifty_price"] = round(yf.Ticker('^NSEI').fast_info['last_price'], 2)
@@ -198,10 +195,11 @@ def get_macro_context(ticker_symbol: str) -> dict:
 # ==========================================
 # NODE 5: THE CIO MARKET SYNTHESIZER
 # ==========================================
-@st.cache_data(ttl=3600) 
+@st.cache_data(ttl=1800) # Cache reduced to 30 mins
 def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: dict) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key: return "⚠️ Setup required: Gemini API Key not found."
+    
     prompt = f"""
     You are a CIO analyzing {ticker} for an employee holding leveraged ESOPs.
     RAW MICRO: Price: ₹{market_data.get('current_price', 0)}, 20-SMA: ₹{market_data.get('sma_20', 0)}, RSI: {market_data.get('rsi_14', 50)} (>70 Overbought, <30 Oversold). News: {macro_data.get('ticker_news', [])}
@@ -212,7 +210,10 @@ def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: d
     * **Leverage Risk Level:** [Low/Medium/High - Safe to hold debt, or accelerate de-risking?]
     Keep it brief, professional, no fluff.
     """
-    try: return genai.Client(api_key=api_key).models.generate_content(model='gemini-2.5-pro', contents=prompt).text
+    try: 
+        # Explicit isolated client instance to prevent connection dropping
+        with genai.Client(api_key=api_key) as client:
+            return client.models.generate_content(model='gemini-2.5-pro', contents=prompt).text
     except Exception as e: return f"⚠️ Engine Offline: {str(e)}"
 
 # ==========================================
@@ -275,10 +276,21 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     {market_intelligence}"""
     
     if is_default:
-        prompt = f"You are a quant advisor. Read state:\n{state}\nRules: {constraint}\nOutput a concise 'Portfolio Health Check' (Margin risk, Tax state, and 1-sentence strategic takeaway from Market Weather). End by asking user intent: [A] Debt Elimination, [B] Maximize Wealth, [C] Capital Extraction."
+        prompt = f"""You are a quant advisor. Read state:\n{state}\nRules: {constraint}
+        Output a concise 'Portfolio Health Check' (Margin risk, Tax state, and 1-sentence strategic takeaway from Market Weather). 
+        End by explicitly asking the user to choose their primary intent. Format this EXACTLY as a vertical bulleted list so it is easy to read on mobile devices:
+        
+        * **[A] Aggressive Debt Elimination** (I want to clear my loan ASAP)
+        * **[B] Maximize Long-Term Wealth** (I am willing to hold the loan for LTCG benefits and stock upside)
+        * **[C] External Capital Extraction** (I need to liquidate a specific amount for personal goals)
+        """
     else:
         prompt = f"You are an algorithmic execution engine. State:\n{state}\nRules: {constraint}\nUser replied: '{user_query}'. Generate a multi-tranche schedule.\nCRITICAL: Format as Phase 1, Phase 2, etc. Each phase MUST include:\n* Action: [Sell/Hold]\n* Timing: [Specific]\n* Target Price: [Rupee]\n* Macro Alignment: [Mandatory 1-sentence explaining how this tranche reacts specifically to the VIX, RSI, or Macro Weather report.]"
-    try: return genai.Client(api_key=api_key).models.generate_content(model='gemini-2.5-pro', contents=prompt).text
+    
+    try:
+        # Explicit isolated client instance to prevent connection dropping
+        with genai.Client(api_key=api_key) as client:
+            return client.models.generate_content(model='gemini-2.5-pro', contents=prompt).text
     except Exception as e: return f"⚠️ AI Error: {str(e)}"
 
 # ==========================================
@@ -287,6 +299,12 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
 st.title("📈 Smart ESOP Investment & Advisory Platform")
 
 st.sidebar.header(f"👤 Logged in as: {st.session_state.user.email.split('@')[0]}")
+
+# --- NEW: IN-APP REFRESH BUTTON (Solves the logout issue) ---
+if st.sidebar.button("🔄 Refresh Live Market Data", type="primary"):
+    st.cache_data.clear() # Clears outdated news and stock prices
+    st.rerun() # Reloads the UI silently without dropping session auth
+
 if st.sidebar.button("🚪 Log Out"):
     st.session_state.user = None
     st.session_state.portfolio_loaded = False
@@ -336,7 +354,7 @@ sim_days = st.sidebar.slider("Simulate Future Date (Days Held)", min_value=1, ma
 
 # --- DATABASE WRITE FUNCTION ---
 st.sidebar.divider()
-if st.sidebar.button("💾 Save Portfolio to Cloud", type="primary"):
+if st.sidebar.button("💾 Save Portfolio to Cloud"):
     with st.spinner("Saving to database..."):
         try:
             supabase.table("portfolios").insert({
