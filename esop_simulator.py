@@ -10,6 +10,7 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 from google import genai
+from google.genai import types
 from supabase import create_client, Client
 
 # ==========================================
@@ -27,11 +28,9 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
-# Initialize Auth State
 if 'user' not in st.session_state: st.session_state.user = None
 if 'portfolio_loaded' not in st.session_state: st.session_state.portfolio_loaded = False
 
-# Database Safe-Casting Functions
 def safe_int(val, fallback=0):
     try: return int(float(val)) if val is not None else fallback
     except: return fallback
@@ -40,7 +39,6 @@ def safe_float(val, fallback=0.0):
     try: return float(val) if val is not None else fallback
     except: return fallback
 
-# --- SECURE LOGIN PORTAL (ANTI-GHOSTING WRAPPER) ---
 if not st.session_state.user:
     login_container = st.empty()
     with login_container.container():
@@ -64,13 +62,12 @@ if not st.session_state.user:
                     try:
                         res = supabase.auth.sign_in_with_password({"email": email, "password": password})
                         st.session_state.user = res.user
-                        login_container.empty() # EXPLICITLY DESTROY THE UI TO PREVENT GHOSTING
+                        login_container.empty()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Login Error: {str(e)}")
     st.stop() 
 
-# --- FETCH SAVED PORTFOLIO ON LOGIN ---
 if st.session_state.user and not st.session_state.portfolio_loaded:
     try:
         data = supabase.table("portfolios").select("*").eq("user_id", st.session_state.user.id).order("updated_at", desc=True).limit(1).execute()
@@ -83,14 +80,12 @@ if st.session_state.user and not st.session_state.portfolio_loaded:
             st.session_state.def_shares = safe_int(row.get("total_shares"))
             st.session_state.def_fmv = safe_float(row.get("fmv", 130.0))
             st.session_state.principal_loan = safe_float(row.get("principal_loan"))
-            
             dt_str = row.get("sanction_date")
             st.session_state.def_date = str(dt_str) if dt_str else str(datetime.date.today() - datetime.timedelta(days=1))
         st.session_state.portfolio_loaded = True
     except Exception as e:
         st.session_state.portfolio_loaded = True 
 
-# Provide fallbacks if no database entry was found
 def_ticker = st.session_state.get("def_ticker", "MEESHO.NS")
 def_emp = st.session_state.get("def_emp", "Active Employee")
 def_partner = st.session_state.get("def_partner", "Nuvama Wealth")
@@ -129,7 +124,7 @@ def calculate_loan_debt(principal: float, days_elapsed: int, prepayments: list, 
     return round(current_principal + total_fees_at_closure + total_interest, 2)
 
 # ==========================================
-# NODE 1.5: ADVANCED TECHNICAL & MICRO DATA
+# NODE 1.5 & 1.6: ADVANCED TECHNICAL & AI DATA FALLBACK
 # ==========================================
 def calculate_rsi(prices, period=14):
     if len(prices) < period: return 50.0
@@ -137,6 +132,38 @@ def calculate_rsi(prices, period=14):
     up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
     rs = up.ewm(com=period-1, adjust=False).mean() / down.ewm(com=period-1, adjust=False).mean()
     return round((100 - (100 / (1 + rs))).iloc[-1], 2)
+
+@st.cache_data(ttl=3600)
+def fetch_ai_analyst_targets(ticker: str, current_price: float) -> dict:
+    api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
+    if not api_key: return None
+    
+    clean_ticker = ticker.replace('.NS', '').replace('.BO', '')
+    prompt = f"""
+    Search the live web for the latest 1-year analyst consensus price targets for the Indian stock '{clean_ticker}' (look at sources like Trendlyne, Tickertape, Economic Times, or Moneycontrol). 
+    Find the High (Bull), Mean/Average (Base), and Low (Bear) target prices in INR.
+    Current trading price is around ₹{current_price}.
+    Return ONLY a raw JSON object with EXACTLY these three keys containing the numeric values. 
+    Example: {{"bull": 220.5, "base": 185.0, "bear": 150.0}}
+    """
+    try:
+        with genai.Client(api_key=api_key) as client:
+            response = client.models.generate_content(
+                model='gemini-2.5-pro',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[{"google_search": {}}],
+                    temperature=0.1
+                )
+            )
+            import json, re
+            match = re.search(r'\{.*\}', response.text, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                if all(k in data for k in ['bull', 'base', 'bear']):
+                    return {"bull": float(data['bull']), "base": float(data['base']), "bear": float(data['bear'])}
+    except Exception: pass
+    return None
 
 @st.cache_data(ttl=300) 
 def get_market_data(ticker_symbol: str) -> dict:
@@ -154,19 +181,31 @@ def get_market_data(ticker_symbol: str) -> dict:
             
         try:
             info = stock.info
-            has_analyst = 'targetMeanPrice' in info and info['targetMeanPrice'] is not None
-            bull = float(info.get('targetHighPrice', current_price * 1.25)) if has_analyst else current_price * 1.25
-            base = float(info.get('targetMeanPrice', current_price * 1.10)) if has_analyst else current_price * 1.10
-            bear = float(info.get('targetLowPrice', current_price * 0.85)) if has_analyst else current_price * 0.85
+            if 'targetMeanPrice' in info and info['targetMeanPrice'] is not None:
+                bull = float(info['targetHighPrice'])
+                base = float(info['targetMeanPrice'])
+                bear = float(info['targetLowPrice'])
+                has_analyst = True
+                prov = "✅ **Data Provenance:** Target benchmarks pulled from live Yahoo Finance Institutional Consensus."
+            else:
+                raise ValueError("Targets missing from Yahoo API")
         except:
-            has_analyst = False
-            bull, base, bear = current_price * 1.25, current_price * 1.10, current_price * 0.85
+            # The Autonomous AI Web Scraper
+            ai_targets = fetch_ai_analyst_targets(ticker_symbol, current_price)
+            if ai_targets:
+                bull, base, bear = ai_targets['bull'], ai_targets['base'], ai_targets['bear']
+                has_analyst = True
+                prov = "✅ **Data Provenance:** Target benchmarks autonomously aggregated from Indian platforms (Trendlyne/Tickertape) via AI Web Search."
+            else:
+                bull, base, bear = current_price * 1.25, current_price * 1.10, current_price * 0.85
+                has_analyst = False
+                prov = "⚠️ **Data Provenance:** Algorithmic Fallback. Live targets currently unavailable across all sources."
         
         return {
             "current_price": round(current_price, 2), "bull_target": round(bull, 2),
             "base_target": round(base, 2), "bear_target": round(bear, 2),
             "sma_20": round(sma_20, 2), "volatility": float(volatility), 
-            "rsi_14": rsi_14, "has_analyst_data": has_analyst
+            "rsi_14": rsi_14, "has_analyst_data": has_analyst, "provenance_msg": prov
         }
     except Exception as e: 
         return {"current_price": 0.0, "error": str(e)}
@@ -181,7 +220,7 @@ def get_rss_news(url, max_items=4):
         return [item.find('title').text for item in root.findall('.//item')[:max_items] if item.find('title') is not None]
     except: return []
 
-@st.cache_data(ttl=900) 
+@st.cache_data(ttl=300) 
 def get_macro_context(ticker_symbol: str) -> dict:
     macro_data = {"nifty_price": 0.0, "usd_inr": 0.0, "india_vix": 0.0, "mc_news": [], "ticker_news": []}
     try: macro_data["nifty_price"] = round(yf.Ticker('^NSEI').fast_info['last_price'], 2)
@@ -198,7 +237,7 @@ def get_macro_context(ticker_symbol: str) -> dict:
 # ==========================================
 # NODE 5: THE CIO MARKET SYNTHESIZER
 # ==========================================
-@st.cache_data(ttl=1800) 
+@st.cache_data(ttl=300) 
 def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: dict) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key: return "⚠️ Setup required: Gemini API Key not found."
@@ -223,7 +262,7 @@ def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: d
 # ==========================================
 def calculate_liquidation_strategy(daily_debt: float, share_price: float, total_shares: int) -> dict:
     if share_price <= 0 or daily_debt <= 0: return {}
-    net_realization = share_price * (1 - 0.0014) # Total margin
+    net_realization = share_price * (1 - 0.0014) 
     shares_to_sell = math.ceil(daily_debt / net_realization)
     return {"net_pocketed": net_realization, "shares_to_sell": shares_to_sell, "remaining_shares": total_shares - shares_to_sell, "unlocked_wealth": (total_shares - shares_to_sell) * share_price}
 
@@ -253,11 +292,22 @@ def generate_projection_data(principal: float, total_shares: int, fmv_on_exercis
             current_sim_price = current_sim_price * math.exp(daily_drift * 3 - 0.5 * step_vol**2 + step_vol * z) + ((linear_exp - current_sim_price) * 0.08)
             
         gross_value = current_sim_price * total_shares
-        margin_call_level = debt / terms["margin_ltv"]
+        margin_call_portfolio_value = debt / terms["margin_ltv"]
+        margin_call_share_price = margin_call_portfolio_value / total_shares if total_shares > 0 else 0
         tax_hit = calculate_taxes(total_shares, current_sim_price, fmv_on_exercise, d)['tax_liability']
         
-        wealth_data.append({"Date": current_date, "Gross Portfolio Value (₹)": gross_value, "Net Wealth (₹)": max(0, gross_value - debt - tax_hit), "Margin Call Threshold (₹)": margin_call_level, "Total Debt (₹)": debt, "Underlying Share Price": f"₹{current_sim_price:,.2f}"})
-        price_data.append({"Date": current_date, "Simulated Price (₹)": current_sim_price, "Bull Target (₹)": market_data['bull_target'], "Base Target (₹)": market_data['base_target'], "Bear Target (₹)": market_data['bear_target']})
+        wealth_data.append({
+            "Date": current_date, "Gross Portfolio Value (₹)": gross_value, 
+            "Net Wealth (₹)": max(0, gross_value - debt - tax_hit), 
+            "Margin Trigger Value (Portfolio) (₹)": margin_call_portfolio_value, 
+            "Total Debt (₹)": debt, "Underlying Share Price": f"₹{current_sim_price:,.2f}"
+        })
+        price_data.append({
+            "Date": current_date, "Simulated Price (₹)": current_sim_price, 
+            "Bull Target (₹)": market_data['bull_target'], "Base Target (₹)": market_data['base_target'], 
+            "Bear Target (₹)": market_data['bear_target'], 
+            "Margin Call Price (Kill Floor) (₹)": margin_call_share_price
+        })
         
     return pd.DataFrame(wealth_data).set_index("Date"), pd.DataFrame(price_data).set_index("Date")
 
@@ -280,11 +330,11 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     if is_default:
         prompt = f"""You are a quant advisor. Read state:\n{state}\nRules: {constraint}
         Output a concise 'Portfolio Health Check' (Margin risk, Tax state, and 1-sentence strategic takeaway from Market Weather). 
-        End by explicitly asking the user to choose their primary intent. Format this EXACTLY as a vertical bulleted list so it is easy to read on mobile devices:
+        End by explicitly asking the user to choose their primary intent. Format this EXACTLY as a vertical bulleted list:
         
         * **[A] Aggressive Debt Elimination** (I want to clear my loan ASAP)
-        * **[B] Maximize Long-Term Wealth** (I am willing to hold the loan for LTCG benefits and stock upside)
-        * **[C] External Capital Extraction** (I need to liquidate a specific amount for personal goals)
+        * **[B] Maximize Long-Term Wealth** (I am willing to hold the loan for LTCG benefits)
+        * **[C] External Capital Extraction** (I need to liquidate a specific amount)
         """
     else:
         prompt = f"You are an algorithmic execution engine. State:\n{state}\nRules: {constraint}\nUser replied: '{user_query}'. Generate a multi-tranche schedule.\nCRITICAL: Format as Phase 1, Phase 2, etc. Each phase MUST include:\n* Action: [Sell/Hold]\n* Timing: [Specific]\n* Target Price: [Rupee]\n* Macro Alignment: [Mandatory 1-sentence explaining how this tranche reacts specifically to the VIX, RSI, or Macro Weather report.]"
@@ -378,7 +428,9 @@ if total_shares == 0 or principal_loan == 0:
 else:
     todays_debt = calculate_loan_debt(principal_loan, sim_days, [], active_terms)
     
-    market_data = get_market_data(ticker)
+    with st.spinner("Syncing Live Market Data..."):
+        market_data = get_market_data(ticker)
+    
     live_price = market_data.get('current_price', 0.0)
 
     if live_price > 0:
@@ -401,16 +453,24 @@ else:
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
-        if market_data['has_analyst_data']: st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
-        else: st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are currently unavailable for this ticker.")
+        
+        # DYNAMIC PROVENANCE BADGE
+        if market_data.get('has_analyst_data'): 
+            st.success(market_data.get('provenance_msg', '✅ Data Loaded.'))
+        else: 
+            st.warning(market_data.get('provenance_msg', '⚠️ Using fallback data.'))
             
-        fig_price = px.line(price_df.reset_index(), x="Date", y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"], color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"])
+        fig_price = px.line(price_df.reset_index(), x="Date", 
+                            y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Margin Call Price (Kill Floor) (₹)", "Simulated Price (₹)"], 
+                            color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#FF8700", "#0068C9"])
         fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
         fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
         st.plotly_chart(fig_price, use_container_width=True)
         
         st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
-        fig_wealth = px.line(wealth_df.reset_index(), x="Date", y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Call Threshold (₹)", "Total Debt (₹)"], color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"], custom_data=["Underlying Share Price"])
+        fig_wealth = px.line(wealth_df.reset_index(), x="Date", 
+                             y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Trigger Value (Portfolio) (₹)", "Total Debt (₹)"], 
+                             color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"], custom_data=["Underlying Share Price"])
         fig_wealth.update_traces(hovertemplate="₹%{y:,.2f}  (Share Price: %{customdata[0]})")
         fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
         st.plotly_chart(fig_wealth, use_container_width=True)
