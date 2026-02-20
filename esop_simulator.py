@@ -28,10 +28,17 @@ def init_supabase() -> Client:
 supabase = init_supabase()
 
 # Initialize Auth State
-if 'user' not in st.session_state:
-    st.session_state.user = None
-if 'portfolio_loaded' not in st.session_state:
-    st.session_state.portfolio_loaded = False
+if 'user' not in st.session_state: st.session_state.user = None
+if 'portfolio_loaded' not in st.session_state: st.session_state.portfolio_loaded = False
+
+# Database Safe-Casting Functions
+def safe_int(val, fallback=0):
+    try: return int(float(val)) if val is not None else fallback
+    except: return fallback
+
+def safe_float(val, fallback=0.0):
+    try: return float(val) if val is not None else fallback
+    except: return fallback
 
 # --- SECURE LOGIN PORTAL ---
 if not st.session_state.user:
@@ -57,7 +64,7 @@ if not st.session_state.user:
                     st.session_state.user = res.user
                     st.rerun()
                 except Exception as e:
-                    st.error("Invalid credentials. Please try again.")
+                    st.error(f"Login Error: {str(e)}")
     st.stop() 
 
 # --- FETCH SAVED PORTFOLIO ON LOGIN ---
@@ -66,14 +73,16 @@ if st.session_state.user and not st.session_state.portfolio_loaded:
         data = supabase.table("portfolios").select("*").eq("user_id", st.session_state.user.id).order("updated_at", desc=True).limit(1).execute()
         if data.data:
             row = data.data[0]
-            st.session_state.def_ticker = row.get("ticker", "MEESHO.NS")
-            st.session_state.def_emp = row.get("emp_status", "Active Employee")
-            st.session_state.def_partner = row.get("partner", "Nuvama Wealth")
-            st.session_state.def_opts = int(row.get("vested_options", 0))
-            st.session_state.def_shares = int(row.get("total_shares", 0))
-            st.session_state.def_fmv = float(row.get("fmv", 130.0))
-            st.session_state.principal_loan = float(row.get("principal_loan", 0.0))
-            st.session_state.def_date = row.get("sanction_date", str(datetime.date.today() - datetime.timedelta(days=1)))
+            st.session_state.def_ticker = str(row.get("ticker", "MEESHO.NS"))
+            st.session_state.def_emp = str(row.get("emp_status", "Active Employee"))
+            st.session_state.def_partner = str(row.get("partner", "Nuvama Wealth"))
+            st.session_state.def_opts = safe_int(row.get("vested_options"))
+            st.session_state.def_shares = safe_int(row.get("total_shares"))
+            st.session_state.def_fmv = safe_float(row.get("fmv", 130.0))
+            st.session_state.principal_loan = safe_float(row.get("principal_loan"))
+            
+            dt_str = row.get("sanction_date")
+            st.session_state.def_date = str(dt_str) if dt_str else str(datetime.date.today() - datetime.timedelta(days=1))
         st.session_state.portfolio_loaded = True
     except Exception as e:
         st.session_state.portfolio_loaded = True 
@@ -130,8 +139,9 @@ def calculate_rsi(prices, period=14):
 def get_market_data(ticker_symbol: str) -> dict:
     try:
         stock = yf.Ticker(ticker_symbol)
-        info = stock.info
-        current_price = info.get('currentPrice', stock.fast_info['last_price'])
+        # Using fast_info directly to prevent Yahoo Finance API blocks on listed entities
+        current_price = float(stock.fast_info['last_price'])
+        
         hist = stock.history(period="3mo")
         if not hist.empty:
             sma_20 = hist['Close'].rolling(window=20).mean().iloc[-1]
@@ -140,16 +150,26 @@ def get_market_data(ticker_symbol: str) -> dict:
         else:
             sma_20, volatility, rsi_14 = current_price, 0.25, 50.0 
             
-        has_analyst = 'targetMeanPrice' in info and info['targetMeanPrice'] is not None
+        try:
+            info = stock.info
+            has_analyst = 'targetMeanPrice' in info and info['targetMeanPrice'] is not None
+            bull = float(info.get('targetHighPrice', current_price * 1.25)) if has_analyst else current_price * 1.25
+            base = float(info.get('targetMeanPrice', current_price * 1.10)) if has_analyst else current_price * 1.10
+            bear = float(info.get('targetLowPrice', current_price * 0.85)) if has_analyst else current_price * 0.85
+        except:
+            has_analyst = False
+            bull, base, bear = current_price * 1.25, current_price * 1.10, current_price * 0.85
+        
         return {
             "current_price": round(current_price, 2), 
-            "bull_target": round(info.get('targetHighPrice') if has_analyst else current_price * 1.25, 2),
-            "base_target": round(info.get('targetMeanPrice') if has_analyst else current_price * 1.10, 2), 
-            "bear_target": round(info.get('targetLowPrice') if has_analyst else current_price * 0.85, 2),
+            "bull_target": round(bull, 2),
+            "base_target": round(base, 2), 
+            "bear_target": round(bear, 2),
             "sma_20": round(sma_20, 2), "volatility": float(volatility), 
             "rsi_14": rsi_14, "has_analyst_data": has_analyst
         }
-    except: return {"current_price": 0.0, "bull_target": 0.0, "base_target": 0.0, "bear_target": 0.0, "sma_20": 0.0, "volatility": 0.25, "rsi_14": 50.0, "has_analyst_data": False}
+    except Exception as e: 
+        return {"current_price": 0.0, "error": str(e)}
 
 # ==========================================
 # NODE 1.8: MULTI-SOURCE MACRO & RSS FETCHER
@@ -184,8 +204,8 @@ def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: d
     if not api_key: return "⚠️ Setup required: Gemini API Key not found."
     prompt = f"""
     You are a CIO analyzing {ticker} for an employee holding leveraged ESOPs.
-    RAW MICRO: Price: ₹{market_data['current_price']}, 20-SMA: ₹{market_data['sma_20']}, RSI: {market_data.get('rsi_14', 50)} (>70 Overbought, <30 Oversold). News: {macro_data['ticker_news']}
-    RAW MACRO: NIFTY: {macro_data['nifty_price']}, VIX: {macro_data['india_vix']} (>20 High Fear). News: {macro_data['mc_news']}
+    RAW MICRO: Price: ₹{market_data.get('current_price', 0)}, 20-SMA: ₹{market_data.get('sma_20', 0)}, RSI: {market_data.get('rsi_14', 50)} (>70 Overbought, <30 Oversold). News: {macro_data.get('ticker_news', [])}
+    RAW MACRO: NIFTY: {macro_data.get('nifty_price', 0)}, VIX: {macro_data.get('india_vix', 0)} (>20 High Fear). News: {macro_data.get('mc_news', [])}
     Synthesize into a 3-bullet "Market Weather Report":
     * **Macro Trend:** [Assess NIFTY, VIX, Broad News]
     * **Micro Sentiment:** [Assess RSI vs SMA, Ticker News]
@@ -250,7 +270,7 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
     state = f"""--- FINANCIAL STATE ---
     Partner: {partner_name} | LTV: {terms['margin_ltv']*100}% | Cure: {terms['cure_period_days']} days
     Shares: {total_shares:,} | Debt: ₹{debt:,.2f} | Days Held: {days_held}
-    Price: ₹{market_data['current_price']:,.2f} | Tax Trigger: {tax_data['tax_type']}
+    Price: ₹{market_data.get('current_price', 0):,.2f} | Tax Trigger: {tax_data.get('tax_type', 'Unknown')}
     --- MARKET WEATHER ---
     {market_intelligence}"""
     
@@ -303,8 +323,13 @@ if st.sidebar.button("Calculate Exact Loan Needed"):
 
 if st.session_state.calc_breakdown: st.sidebar.info(st.session_state.calc_breakdown)
 
-principal_loan = st.sidebar.number_input("Total Loan Principal (₹)", min_value=0.0, value=float(st.session_state.principal_loan), step=10000.0)
-sanction_dt = datetime.datetime.strptime(def_date, "%Y-%m-%d").date() if def_date else datetime.date.today() - datetime.timedelta(days=1)
+principal_loan = st.sidebar.number_input("Total Loan Principal (₹)", min_value=0.0, value=safe_float(st.session_state.get("principal_loan", 0.0)), step=10000.0)
+
+try:
+    sanction_dt = datetime.datetime.strptime(def_date, "%Y-%m-%d").date() if def_date else datetime.date.today() - datetime.timedelta(days=1)
+except:
+    sanction_dt = datetime.date.today() - datetime.timedelta(days=1)
+
 loan_sanction_date = st.sidebar.date_input("Loan Sanction Date", sanction_dt)
 days_held = max(1, (datetime.date.today() - loan_sanction_date).days)
 sim_days = st.sidebar.slider("Simulate Future Date (Days Held)", min_value=1, max_value=400, value=days_held)
@@ -335,8 +360,9 @@ if total_shares == 0 or principal_loan == 0:
     st.info("👋 Welcome. Please enter your Equity details and calculate your Loan Principal in the sidebar to begin.")
 else:
     todays_debt = calculate_loan_debt(principal_loan, sim_days, [], active_terms)
+    
     market_data = get_market_data(ticker)
-    live_price = market_data['current_price']
+    live_price = market_data.get('current_price', 0.0)
 
     if live_price > 0:
         strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
@@ -346,18 +372,21 @@ else:
         col1, col2, col3 = st.columns(3)
         col1.metric("Live Share Price", f"₹{live_price:,.2f}")
         col2.metric("Simulated Debt", f"₹{todays_debt:,.2f}")
-        col3.metric("Net Pocketed / Share", f"₹{strategy['net_pocketed']:,.2f}")
+        col3.metric("Net Pocketed / Share", f"₹{strategy.get('net_pocketed', 0):,.2f}")
         
         st.divider()
         col4, col5 = st.columns(2)
-        col4.metric("Shares to Sell to Clear Debt", f"{strategy['shares_to_sell']:,}", delta_color="inverse")
-        col5.metric("Remaining Shares (Free & Clear)", f"{strategy['remaining_shares']:,}", f"Gross Value: ₹{strategy['unlocked_wealth']:,.2f}", delta_color="normal")
+        col4.metric("Shares to Sell to Clear Debt", f"{strategy.get('shares_to_sell', 0):,}", delta_color="inverse")
+        col5.metric("Remaining Shares (Free & Clear)", f"{strategy.get('remaining_shares', 0):,}", f"Gross Value: ₹{strategy.get('unlocked_wealth', 0):,.2f}", delta_color="normal")
         st.warning(f"🚨 **{int(active_terms['margin_ltv']*100)}% LTV Margin Call Threshold ({selected_partner}):** ₹{danger_price:,.2f} per share. (If your stock drops to this price, your loan LTV hits {int(active_terms['margin_ltv']*100)}%. You then have a strict {active_terms['cure_period_days']}-day cure window).")
 
         wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, [], loan_sanction_date, active_terms)
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
+        if market_data['has_analyst_data']: st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
+        else: st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are currently unavailable for this ticker.")
+            
         fig_price = px.line(price_df.reset_index(), x="Date", y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"], color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"])
         fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
         fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
@@ -375,18 +404,22 @@ else:
         
         macro_data = get_macro_context(ticker)
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        col_m1.metric("NIFTY 50", f"{macro_data['nifty_price']:,.2f}", help="The benchmark index of India's top 50 companies.")
-        col_m2.metric("India VIX (Fear Gauge)", f"{macro_data['india_vix']:,.2f}", help="Measures expected market volatility. >20 indicates high fear/risk.")
+        col_m1.metric("NIFTY 50", f"{macro_data.get('nifty_price', 0):,.2f}", help="The benchmark index of India's top 50 companies.")
+        col_m2.metric("India VIX (Fear Gauge)", f"{macro_data.get('india_vix', 0):,.2f}", help="Measures expected market volatility. >20 indicates high fear/risk.")
         col_m3.metric("Stock RSI (14-Day)", f"{market_data.get('rsi_14', 50)}", help="Momentum indicator. >70 means the stock is 'Overbought'.")
-        col_m4.metric("USD / INR", f"₹{macro_data['usd_inr']:,.2f}", help="Currency exchange rate.")
+        col_m4.metric("USD / INR", f"₹{macro_data.get('usd_inr', 0):,.2f}", help="Currency exchange rate.")
         
         col_news1, col_news2 = st.columns(2)
         with col_news1:
             with st.expander("📰 Broad Market News (Moneycontrol)", expanded=False):
-                for headline in macro_data['mc_news']: st.markdown(f"- {headline}")
+                if macro_data.get('mc_news'):
+                    for headline in macro_data['mc_news']: st.markdown(f"- {headline}")
+                else: st.markdown("- No recent headlines fetched.")
         with col_news2:
             with st.expander(f"📰 {ticker} News (Google News)", expanded=False):
-                for headline in macro_data['ticker_news']: st.markdown(f"- {headline}")
+                if macro_data.get('ticker_news'):
+                    for headline in macro_data['ticker_news']: st.markdown(f"- {headline}")
+                else: st.markdown("- No recent ticker headlines fetched.")
 
         with st.spinner("CIO Agent synthesizing market weather..."):
             market_weather = synthesize_market_intelligence(ticker, market_data, macro_data)
@@ -394,7 +427,7 @@ else:
 
         st.divider()
         st.subheader("🧠 Interactive Algorithmic Execution Agent")
-        tax_data = calculate_taxes(strategy['shares_to_sell'], live_price, fmv_on_exercise, sim_days)
+        tax_data = calculate_taxes(strategy.get('shares_to_sell', 0), live_price, fmv_on_exercise, sim_days)
         
         if "messages" not in st.session_state:
             st.session_state.messages = []
@@ -416,3 +449,5 @@ else:
                 response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, market_weather, is_default=False)
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 st.rerun()
+    else:
+        st.error(f"⚠️ Could not fetch live market data for {ticker}. Error: {market_data.get('error', 'Unknown Error')}")
