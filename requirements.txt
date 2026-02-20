@@ -3,3 +3,4 @@ yfinance
 google-genai
 PyPDF2
 plotly
+supabase
