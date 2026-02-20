@@ -40,31 +40,34 @@ def safe_float(val, fallback=0.0):
     try: return float(val) if val is not None else fallback
     except: return fallback
 
-# --- SECURE LOGIN PORTAL ---
+# --- SECURE LOGIN PORTAL (ANTI-GHOSTING WRAPPER) ---
 if not st.session_state.user:
-    st.title("🔐 Welcome to Smart ESOP Advisor")
-    st.markdown("Please log in or create a secure account to track your ESOP portfolio and debt compounding.")
-    
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        auth_mode = st.radio("Select Action", ["Login", "Sign Up"])
-        email = st.text_input("Email Address")
-        password = st.text_input("Password", type="password")
+    login_container = st.empty()
+    with login_container.container():
+        st.title("🔐 Welcome to Smart ESOP Advisor")
+        st.markdown("Please log in or create a secure account to track your ESOP portfolio and debt compounding.")
         
-        if st.button("Submit"):
-            if auth_mode == "Sign Up":
-                try:
-                    res = supabase.auth.sign_up({"email": email, "password": password})
-                    st.success("Account created successfully! You can now log in.")
-                except Exception as e:
-                    st.error(f"Sign Up Error: {str(e)}")
-            else:
-                try:
-                    res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-                    st.session_state.user = res.user
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Login Error: {str(e)}")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            auth_mode = st.radio("Select Action", ["Login", "Sign Up"], key="auth_mode_radio")
+            email = st.text_input("Email Address", key="login_email_input")
+            password = st.text_input("Password", type="password", key="login_pass_input")
+            
+            if st.button("Submit", key="auth_submit_btn"):
+                if auth_mode == "Sign Up":
+                    try:
+                        res = supabase.auth.sign_up({"email": email, "password": password})
+                        st.success("Account created successfully! You can now log in.")
+                    except Exception as e:
+                        st.error(f"Sign Up Error: {str(e)}")
+                else:
+                    try:
+                        res = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                        st.session_state.user = res.user
+                        login_container.empty() # EXPLICITLY DESTROY THE UI TO PREVENT GHOSTING
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Login Error: {str(e)}")
     st.stop() 
 
 # --- FETCH SAVED PORTFOLIO ON LOGIN ---
@@ -135,7 +138,7 @@ def calculate_rsi(prices, period=14):
     rs = up.ewm(com=period-1, adjust=False).mean() / down.ewm(com=period-1, adjust=False).mean()
     return round((100 - (100 / (1 + rs))).iloc[-1], 2)
 
-@st.cache_data(ttl=300) # Short 5-min cache for highly active stock data
+@st.cache_data(ttl=300) 
 def get_market_data(ticker_symbol: str) -> dict:
     try:
         stock = yf.Ticker(ticker_symbol)
@@ -178,7 +181,7 @@ def get_rss_news(url, max_items=4):
         return [item.find('title').text for item in root.findall('.//item')[:max_items] if item.find('title') is not None]
     except: return []
 
-@st.cache_data(ttl=900) # 15-min cache to ensure news updates frequently
+@st.cache_data(ttl=900) 
 def get_macro_context(ticker_symbol: str) -> dict:
     macro_data = {"nifty_price": 0.0, "usd_inr": 0.0, "india_vix": 0.0, "mc_news": [], "ticker_news": []}
     try: macro_data["nifty_price"] = round(yf.Ticker('^NSEI').fast_info['last_price'], 2)
@@ -195,7 +198,7 @@ def get_macro_context(ticker_symbol: str) -> dict:
 # ==========================================
 # NODE 5: THE CIO MARKET SYNTHESIZER
 # ==========================================
-@st.cache_data(ttl=1800) # Cache reduced to 30 mins
+@st.cache_data(ttl=1800) 
 def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: dict) -> str:
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key: return "⚠️ Setup required: Gemini API Key not found."
@@ -211,7 +214,6 @@ def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: d
     Keep it brief, professional, no fluff.
     """
     try: 
-        # Explicit isolated client instance to prevent connection dropping
         with genai.Client(api_key=api_key) as client:
             return client.models.generate_content(model='gemini-2.5-pro', contents=prompt).text
     except Exception as e: return f"⚠️ Engine Offline: {str(e)}"
@@ -288,7 +290,6 @@ def generate_ai_insights(user_query: str, emp_status: str, total_shares: int, de
         prompt = f"You are an algorithmic execution engine. State:\n{state}\nRules: {constraint}\nUser replied: '{user_query}'. Generate a multi-tranche schedule.\nCRITICAL: Format as Phase 1, Phase 2, etc. Each phase MUST include:\n* Action: [Sell/Hold]\n* Timing: [Specific]\n* Target Price: [Rupee]\n* Macro Alignment: [Mandatory 1-sentence explaining how this tranche reacts specifically to the VIX, RSI, or Macro Weather report.]"
     
     try:
-        # Explicit isolated client instance to prevent connection dropping
         with genai.Client(api_key=api_key) as client:
             return client.models.generate_content(model='gemini-2.5-pro', contents=prompt).text
     except Exception as e: return f"⚠️ AI Error: {str(e)}"
@@ -300,10 +301,9 @@ st.title("📈 Smart ESOP Investment & Advisory Platform")
 
 st.sidebar.header(f"👤 Logged in as: {st.session_state.user.email.split('@')[0]}")
 
-# --- NEW: IN-APP REFRESH BUTTON (Solves the logout issue) ---
 if st.sidebar.button("🔄 Refresh Live Market Data", type="primary"):
-    st.cache_data.clear() # Clears outdated news and stock prices
-    st.rerun() # Reloads the UI silently without dropping session auth
+    st.cache_data.clear() 
+    st.rerun() 
 
 if st.sidebar.button("🚪 Log Out"):
     st.session_state.user = None
@@ -350,122 +350,4 @@ except:
 
 loan_sanction_date = st.sidebar.date_input("Loan Sanction Date", sanction_dt)
 days_held = max(1, (datetime.date.today() - loan_sanction_date).days)
-sim_days = st.sidebar.slider("Simulate Future Date (Days Held)", min_value=1, max_value=400, value=days_held)
-
-# --- DATABASE WRITE FUNCTION ---
-st.sidebar.divider()
-if st.sidebar.button("💾 Save Portfolio to Cloud"):
-    with st.spinner("Saving to database..."):
-        try:
-            supabase.table("portfolios").insert({
-                "user_id": st.session_state.user.id,
-                "email": st.session_state.user.email,
-                "ticker": ticker,
-                "emp_status": emp_status,
-                "partner": selected_partner,
-                "vested_options": vested_options,
-                "total_shares": total_shares,
-                "fmv": fmv_on_exercise,
-                "principal_loan": principal_loan,
-                "sanction_date": str(loan_sanction_date)
-            }).execute()
-            st.sidebar.success("✅ Saved securely to cloud!")
-        except Exception as e:
-            st.sidebar.error(f"Save failed: {str(e)}")
-
-# --- MAIN DASHBOARD RENDER ---
-if total_shares == 0 or principal_loan == 0:
-    st.info("👋 Welcome. Please enter your Equity details and calculate your Loan Principal in the sidebar to begin.")
-else:
-    todays_debt = calculate_loan_debt(principal_loan, sim_days, [], active_terms)
-    
-    market_data = get_market_data(ticker)
-    live_price = market_data.get('current_price', 0.0)
-
-    if live_price > 0:
-        strategy = calculate_liquidation_strategy(todays_debt, live_price, total_shares)
-        danger_price = todays_debt / (total_shares * active_terms['margin_ltv'])
-        
-        st.header(f"Simulated Execution Status (Day {sim_days})")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Live Share Price", f"₹{live_price:,.2f}")
-        col2.metric("Simulated Debt", f"₹{todays_debt:,.2f}")
-        col3.metric("Net Pocketed / Share", f"₹{strategy.get('net_pocketed', 0):,.2f}")
-        
-        st.divider()
-        col4, col5 = st.columns(2)
-        col4.metric("Shares to Sell to Clear Debt", f"{strategy.get('shares_to_sell', 0):,}", delta_color="inverse")
-        col5.metric("Remaining Shares (Free & Clear)", f"{strategy.get('remaining_shares', 0):,}", f"Gross Value: ₹{strategy.get('unlocked_wealth', 0):,.2f}", delta_color="normal")
-        st.warning(f"🚨 **{int(active_terms['margin_ltv']*100)}% LTV Margin Call Threshold ({selected_partner}):** ₹{danger_price:,.2f} per share. (If your stock drops to this price, your loan LTV hits {int(active_terms['margin_ltv']*100)}%. You then have a strict {active_terms['cure_period_days']}-day cure window).")
-
-        wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, [], loan_sanction_date, active_terms)
-        
-        st.divider()
-        st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
-        if market_data['has_analyst_data']: st.success("✅ **Data Provenance:** Target benchmarks are pulled from live Wall Street Analyst Consensus.")
-        else: st.warning("⚠️ **Data Provenance:** Algorithmic Fallback. Live analyst consensus targets are currently unavailable for this ticker.")
-            
-        fig_price = px.line(price_df.reset_index(), x="Date", y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Simulated Price (₹)"], color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#0068C9"])
-        fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
-        fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
-        st.plotly_chart(fig_price, use_container_width=True)
-        
-        st.subheader("📊 True Net Wealth Trendline (Post-Tax & Debt)")
-        fig_wealth = px.line(wealth_df.reset_index(), x="Date", y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Call Threshold (₹)", "Total Debt (₹)"], color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"], custom_data=["Underlying Share Price"])
-        fig_wealth.update_traces(hovertemplate="₹%{y:,.2f}  (Share Price: %{customdata[0]})")
-        fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
-        st.plotly_chart(fig_wealth, use_container_width=True)
-        
-        st.divider()
-        st.header("🌍 Macro & Market Intelligence")
-        st.caption("This engine aggregates live institutional data and news sentiment to evaluate the broader market 'weather'.")
-        
-        macro_data = get_macro_context(ticker)
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        col_m1.metric("NIFTY 50", f"{macro_data.get('nifty_price', 0):,.2f}", help="The benchmark index of India's top 50 companies.")
-        col_m2.metric("India VIX (Fear Gauge)", f"{macro_data.get('india_vix', 0):,.2f}", help="Measures expected market volatility. >20 indicates high fear/risk.")
-        col_m3.metric("Stock RSI (14-Day)", f"{market_data.get('rsi_14', 50)}", help="Momentum indicator. >70 means the stock is 'Overbought'.")
-        col_m4.metric("USD / INR", f"₹{macro_data.get('usd_inr', 0):,.2f}", help="Currency exchange rate.")
-        
-        col_news1, col_news2 = st.columns(2)
-        with col_news1:
-            with st.expander("📰 Broad Market News (Moneycontrol)", expanded=False):
-                if macro_data.get('mc_news'):
-                    for headline in macro_data['mc_news']: st.markdown(f"- {headline}")
-                else: st.markdown("- No recent headlines fetched.")
-        with col_news2:
-            with st.expander(f"📰 {ticker} News (Google News)", expanded=False):
-                if macro_data.get('ticker_news'):
-                    for headline in macro_data['ticker_news']: st.markdown(f"- {headline}")
-                else: st.markdown("- No recent ticker headlines fetched.")
-
-        with st.spinner("CIO Agent synthesizing market weather..."):
-            market_weather = synthesize_market_intelligence(ticker, market_data, macro_data)
-        st.info(f"**🧠 CIO Market Weather Report:**\n\n{market_weather}")
-
-        st.divider()
-        st.subheader("🧠 Interactive Algorithmic Execution Agent")
-        tax_data = calculate_taxes(strategy.get('shares_to_sell', 0), live_price, fmv_on_exercise, sim_days)
-        
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-            with st.spinner("Analyzing portfolio health against Macro conditions..."):
-                baseline_plan = generate_ai_insights("", emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, market_weather, is_default=True)
-                st.session_state.messages.append({"role": "assistant", "content": f"{baseline_plan}"})
-                
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-
-        with st.form("strategy_chat_form", clear_on_submit=True):
-            user_prompt = st.text_input("Reply with A, B, C, or type a custom goal:", placeholder="e.g., 'C - I need ₹20 Lakhs in exactly 4 months.'")
-            submitted = st.form_submit_button("Generate Strategic Schedule")
-            
-        if submitted and user_prompt:
-            st.session_state.messages.append({"role": "user", "content": user_prompt})
-            with st.spinner("Calculating precision tranches..."):
-                response = generate_ai_insights(user_prompt, emp_status, total_shares, todays_debt, market_data, strategy, danger_price, tax_data, sim_days, selected_partner, active_terms, market_weather, is_default=False)
-                st.session_state.messages.append({"role": "assistant", "content": response})
-                st.rerun()
-    else:
-        st.error(f"⚠️ Could not fetch live market data for {ticker}. Error: {market_data.get('error', 'Unknown Error')}")
+sim_days = st.sidebar.slider("Simulate Future Date (Days Held
