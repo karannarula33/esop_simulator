@@ -151,10 +151,7 @@ def fetch_ai_analyst_targets(ticker: str, current_price: float) -> dict:
             response = client.models.generate_content(
                 model='gemini-2.5-pro',
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    tools=[{"google_search": {}}],
-                    temperature=0.1
-                )
+                config=types.GenerateContentConfig(tools=[{"google_search": {}}], temperature=0.1)
             )
             import json, re
             match = re.search(r'\{.*\}', response.text, re.DOTALL)
@@ -182,24 +179,17 @@ def get_market_data(ticker_symbol: str) -> dict:
         try:
             info = stock.info
             if 'targetMeanPrice' in info and info['targetMeanPrice'] is not None:
-                bull = float(info['targetHighPrice'])
-                base = float(info['targetMeanPrice'])
-                bear = float(info['targetLowPrice'])
-                has_analyst = True
-                prov = "✅ **Data Provenance:** Target benchmarks pulled from live Yahoo Finance Institutional Consensus."
-            else:
-                raise ValueError("Targets missing from Yahoo API")
+                bull, base, bear = float(info['targetHighPrice']), float(info['targetMeanPrice']), float(info['targetLowPrice'])
+                has_analyst, prov = True, "✅ **Data Provenance:** Target benchmarks pulled from live Yahoo Finance Institutional Consensus."
+            else: raise ValueError("Targets missing")
         except:
-            # The Autonomous AI Web Scraper
             ai_targets = fetch_ai_analyst_targets(ticker_symbol, current_price)
             if ai_targets:
                 bull, base, bear = ai_targets['bull'], ai_targets['base'], ai_targets['bear']
-                has_analyst = True
-                prov = "✅ **Data Provenance:** Target benchmarks autonomously aggregated from Indian platforms (Trendlyne/Tickertape) via AI Web Search."
+                has_analyst, prov = True, "✅ **Data Provenance:** Target benchmarks autonomously aggregated from Indian platforms via AI Web Search."
             else:
                 bull, base, bear = current_price * 1.25, current_price * 1.10, current_price * 0.85
-                has_analyst = False
-                prov = "⚠️ **Data Provenance:** Algorithmic Fallback. Live targets currently unavailable across all sources."
+                has_analyst, prov = False, "⚠️ **Data Provenance:** Algorithmic Fallback. Live targets currently unavailable across all sources."
         
         return {
             "current_price": round(current_price, 2), "bull_target": round(bull, 2),
@@ -207,8 +197,7 @@ def get_market_data(ticker_symbol: str) -> dict:
             "sma_20": round(sma_20, 2), "volatility": float(volatility), 
             "rsi_14": rsi_14, "has_analyst_data": has_analyst, "provenance_msg": prov
         }
-    except Exception as e: 
-        return {"current_price": 0.0, "error": str(e)}
+    except Exception as e: return {"current_price": 0.0, "error": str(e)}
 
 # ==========================================
 # NODE 1.8: MULTI-SOURCE MACRO & RSS FETCHER
@@ -244,8 +233,8 @@ def synthesize_market_intelligence(ticker: str, market_data: dict, macro_data: d
     
     prompt = f"""
     You are a CIO analyzing {ticker} for an employee holding leveraged ESOPs.
-    RAW MICRO: Price: ₹{market_data.get('current_price', 0)}, 20-SMA: ₹{market_data.get('sma_20', 0)}, RSI: {market_data.get('rsi_14', 50)} (>70 Overbought, <30 Oversold). News: {macro_data.get('ticker_news', [])}
-    RAW MACRO: NIFTY: {macro_data.get('nifty_price', 0)}, VIX: {macro_data.get('india_vix', 0)} (>20 High Fear). News: {macro_data.get('mc_news', [])}
+    RAW MICRO: Price: ₹{market_data.get('current_price', 0)}, 20-SMA: ₹{market_data.get('sma_20', 0)}, RSI: {market_data.get('rsi_14', 50)}. News: {macro_data.get('ticker_news', [])}
+    RAW MACRO: NIFTY: {macro_data.get('nifty_price', 0)}, VIX: {macro_data.get('india_vix', 0)}. News: {macro_data.get('mc_news', [])}
     Synthesize into a 3-bullet "Market Weather Report":
     * **Macro Trend:** [Assess NIFTY, VIX, Broad News]
     * **Micro Sentiment:** [Assess RSI vs SMA, Ticker News]
@@ -273,40 +262,68 @@ def calculate_taxes(shares_sold: int, sell_price: float, fmv_on_exercise: float,
     return {"tax_type": "LTCG (12.5%)", "tax_liability": round(max(0, capital_gains - 125000) * 0.125, 2)}
 
 # ==========================================
-# NODE 2.5: MEAN-REVERTING PROJECTION 
+# NODE 2.5: THE "REALITY ANCHOR" PROJECTION ENGINE
 # ==========================================
-def generate_projection_data(principal: float, total_shares: int, fmv_on_exercise: float, market_data: dict, prepayments: list, sanction_date: datetime.date, terms: dict):
+def generate_projection_data(principal: float, total_shares: int, fmv_on_exercise: float, market_data: dict, prepayments: list, sanction_date: datetime.date, terms: dict, ticker: str):
     np.random.seed(42) 
-    wealth_data, price_data, p0 = [], [], market_data['current_price']
-    daily_drift = math.log(market_data['base_target'] / p0) / 365 if p0 > 0 else 0
-    current_sim_price = p0
+    wealth_data, price_data = [], []
+    today = datetime.date.today()
     
+    # 1. Fetch Actual Historical Data from Sanction Date to Today
+    hist_closes = {}
+    if sanction_date <= today:
+        try:
+            start_fetch = sanction_date - datetime.timedelta(days=7)
+            hist_df = yf.Ticker(ticker).history(start=start_fetch.strftime('%Y-%m-%d'))
+            if not hist_df.empty:
+                hist_closes = {ts.date(): float(val) for ts, val in hist_df['Close'].dropna().items()}
+        except: pass
+
+    current_live_price = market_data['current_price']
+    daily_drift = math.log(market_data['base_target'] / current_live_price) / 365 if current_live_price > 0 else 0
+    last_known_price = current_live_price
+    
+    # 2. Daily Iteration (Past History + Future Simulation)
     for d in range(1, 400, 3):
         current_date = sanction_date + datetime.timedelta(days=d)
         debt = calculate_loan_debt(principal, d, prepayments, terms)
+        is_historical = current_date <= today
         
-        if d > 1:
+        if is_historical:
+            search_date = current_date
+            found_price = last_known_price 
+            for _ in range(7): # Lookback for weekends/holidays
+                if search_date in hist_closes:
+                    found_price = hist_closes[search_date]
+                    break
+                search_date -= datetime.timedelta(days=1)
+            sim_price = found_price
+            last_known_price = sim_price # Anchor the future simulation to this point
+            data_type = "Actual History"
+        else:
             step_vol = market_data['volatility'] * math.sqrt(3/252)
             z = np.random.normal(0, 1)
-            linear_exp = p0 + ((market_data['base_target'] - p0) / 365) * d
-            current_sim_price = current_sim_price * math.exp(daily_drift * 3 - 0.5 * step_vol**2 + step_vol * z) + ((linear_exp - current_sim_price) * 0.08)
+            linear_exp = last_known_price + ((market_data['base_target'] - last_known_price) / 365) * 3
+            last_known_price = last_known_price * math.exp(daily_drift * 3 - 0.5 * step_vol**2 + step_vol * z) + ((linear_exp - last_known_price) * 0.08)
+            sim_price = last_known_price
+            data_type = "AI Simulation"
             
-        gross_value = current_sim_price * total_shares
+        gross_value = sim_price * total_shares
         margin_call_portfolio_value = debt / terms["margin_ltv"]
         margin_call_share_price = margin_call_portfolio_value / total_shares if total_shares > 0 else 0
-        tax_hit = calculate_taxes(total_shares, current_sim_price, fmv_on_exercise, d)['tax_liability']
+        tax_hit = calculate_taxes(total_shares, sim_price, fmv_on_exercise, d)['tax_liability']
         
         wealth_data.append({
             "Date": current_date, "Gross Portfolio Value (₹)": gross_value, 
             "Net Wealth (₹)": max(0, gross_value - debt - tax_hit), 
             "Margin Trigger Value (Portfolio) (₹)": margin_call_portfolio_value, 
-            "Total Debt (₹)": debt, "Underlying Share Price": f"₹{current_sim_price:,.2f}"
+            "Total Debt (₹)": debt, "Underlying Share Price": f"₹{sim_price:,.2f} ({data_type})"
         })
         price_data.append({
-            "Date": current_date, "Simulated Price (₹)": current_sim_price, 
+            "Date": current_date, "Share Price (₹)": sim_price, 
             "Bull Target (₹)": market_data['bull_target'], "Base Target (₹)": market_data['base_target'], 
             "Bear Target (₹)": market_data['bear_target'], 
-            "Margin Call Price (Kill Floor) (₹)": margin_call_share_price
+            "Margin Kill Floor (₹)": margin_call_share_price
         })
         
     return pd.DataFrame(wealth_data).set_index("Date"), pd.DataFrame(price_data).set_index("Date")
@@ -449,19 +466,18 @@ else:
         col5.metric("Remaining Shares (Free & Clear)", f"{strategy.get('remaining_shares', 0):,}", f"Gross Value: ₹{strategy.get('unlocked_wealth', 0):,.2f}", delta_color="normal")
         st.warning(f"🚨 **{int(active_terms['margin_ltv']*100)}% LTV Margin Call Threshold ({selected_partner}):** ₹{danger_price:,.2f} per share. (If your stock drops to this price, your loan LTV hits {int(active_terms['margin_ltv']*100)}%. You then have a strict {active_terms['cure_period_days']}-day cure window).")
 
-        wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, [], loan_sanction_date, active_terms)
+        wealth_df, price_df = generate_projection_data(principal_loan, total_shares, fmv_on_exercise, market_data, [], loan_sanction_date, active_terms, ticker)
         
         st.divider()
         st.subheader("📈 Projected Share Price vs. Analyst Benchmarks")
         
-        # DYNAMIC PROVENANCE BADGE
         if market_data.get('has_analyst_data'): 
             st.success(market_data.get('provenance_msg', '✅ Data Loaded.'))
         else: 
             st.warning(market_data.get('provenance_msg', '⚠️ Using fallback data.'))
             
         fig_price = px.line(price_df.reset_index(), x="Date", 
-                            y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Margin Call Price (Kill Floor) (₹)", "Simulated Price (₹)"], 
+                            y=["Bull Target (₹)", "Base Target (₹)", "Bear Target (₹)", "Margin Kill Floor (₹)", "Share Price (₹)"], 
                             color_discrete_sequence=["#29B09D", "#7C3AED", "#FF4B4B", "#FF8700", "#0068C9"])
         fig_price.update_traces(hovertemplate="₹%{y:,.2f}")
         fig_price.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Share Price (₹)", legend_title="")
@@ -471,7 +487,8 @@ else:
         fig_wealth = px.line(wealth_df.reset_index(), x="Date", 
                              y=["Gross Portfolio Value (₹)", "Net Wealth (₹)", "Margin Trigger Value (Portfolio) (₹)", "Total Debt (₹)"], 
                              color_discrete_sequence=["#0068C9", "#29B09D", "#FF8700", "#FF4B4B"], custom_data=["Underlying Share Price"])
-        fig_wealth.update_traces(hovertemplate="₹%{y:,.2f}  (Share Price: %{customdata[0]})")
+        
+        fig_wealth.update_traces(hovertemplate="<b>Value:</b> ₹%{y:,.2f}<br><b>Share Price on Date:</b> %{customdata[0]}")
         fig_wealth.update_layout(hovermode="x unified", xaxis_title="", yaxis_title="Total Value (₹)", legend_title="")
         st.plotly_chart(fig_wealth, use_container_width=True)
         
